@@ -4,13 +4,15 @@
 //! code：`unknownMethod`（没有这个方法）、`invalidParams`（参数不对）、`internal`（核心里出错，C 接口层兜住的 panic 也报这个）。
 //! 时间一律用 Unix 毫秒（`now` 不传 = 现在），时长一律用秒（浮点）。
 //!
-//! 方法按模块分组（`quota.*`、`tools.*`、`secrets.*`、`vault.*`、`fold.*`、`conversations.*`、`diff.*`、`journal.*`、`engines.*`、`prompts.*`）。有状态的（`vault.*`、`journal.*`）先 open 拿句柄，后面的方法带上它，每个方法的参数和结果写在下面各自的函数上。
+//! 方法按模块分组（`quota.*`、`tools.*`、`secrets.*`、`vault.*`、`fold.*`、`conversations.*`、`diff.*`、`journal.*`、`engines.*`、`prompts.*`、`promptHistory.*`）。有状态的（`vault.*`、`journal.*`）先 open 拿句柄，后面的方法带上它，每个方法的参数和结果写在下面各自的函数上。
 
 use serde_json::{Map, Value, json};
 
 use std::collections::{HashMap, HashSet};
 
-use crate::{conversations, engines, folding, journal, line_diff, prompts, quota, secret_guard, secret_store, tool_aliases};
+use crate::{
+    conversations, engines, folding, journal, line_diff, prompt_history, prompts, quota, secret_guard, secret_store, tool_aliases,
+};
 
 #[derive(Debug)]
 pub struct ApiError {
@@ -417,6 +419,47 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
             Ok(Value::Null)
         }
 
+        // {} → {gitBase: [每次都带的 git 设置], logArguments: [读历史用的参数]}
+        "promptHistory.git" => Ok(json!({ "gitBase": prompt_history::GIT_BASE, "logArguments": prompt_history::LOG_ARGUMENTS })),
+        // {version} → 启动时那一次的提交说明（按上次准备提示词时的合并结果）
+        "promptHistory.startupMessage" => {
+            Ok(Value::from(prompt_history::startup_message(&string(params, "version")?, &prompts::last_merge())))
+        }
+        // {} → null（记下现在实际用的段：每次提交完、没装 git 时也记）
+        "promptHistory.markCommitted" => {
+            prompt_history::mark_committed();
+            Ok(Value::Null)
+        }
+        // {} → 上次提交以来改了哪几段（提交说明）
+        "promptHistory.describeChanges" => Ok(Value::from(prompt_history::describe_changes())),
+        // {output} → [{id, shortID, time, message}]（git log 的输出解成版本列表，新的在前）
+        "promptHistory.parseLog" => Ok(Value::from(
+            prompt_history::parse_log(&string(params, "output")?).into_iter().map(|version| version_json(&version)).collect::<Vec<_>>(),
+        )),
+        // {history, id} → 「时间 的版本（说明）」，找不到是短编号
+        "promptHistory.label" => Ok(Value::from(prompt_history::version_label(&versions(params)?, &string(params, "id")?))),
+        // {history, byVersion: [{version, tasks, firstPass, deliveries, followups}], rejected} → {bad, good, goodID, reason, note, message} | null
+        "promptHistory.regression" => {
+            let mut by_version = Vec::new();
+            for item in list(params, "byVersion")? {
+                let field = |key: &str| item.get(key).and_then(Value::as_i64).unwrap_or(0);
+                let version = item.get("version").and_then(Value::as_str).unwrap_or("").to_string();
+                by_version.push((
+                    version,
+                    prompt_history::Metrics {
+                        tasks: field("tasks"),
+                        first_pass: field("firstPass"),
+                        deliveries: field("deliveries"),
+                        followups: field("followups"),
+                    },
+                ));
+            }
+            let found = prompt_history::regression(&versions(params)?, &by_version, &string_list(params, "rejected")?);
+            Ok(found.map_or(Value::Null, |found| {
+                json!({ "bad": found.bad, "good": found.good, "goodID": found.good_id, "reason": found.reason, "note": found.note, "message": found.message })
+            }))
+        }
+
         // {} → 主会话折叠的预算（估算 token；子 Agent 会话是它的两倍）
         "fold.budget" => Ok(Value::from(folding::BUDGET)),
         // {text} → 较早的回复正文的摘要
@@ -509,6 +552,20 @@ fn journal_of(params: &Params, body: impl FnOnce(&mut journal::Journal) -> Value
 
 fn to_value(value: impl serde::Serialize) -> Result<Value, ApiError> {
     serde_json::to_value(value).map_err(|error| ApiError { code: "internal", message: error.to_string() })
+}
+
+fn version_json(version: &prompt_history::Version) -> Value {
+    json!({ "id": version.id, "shortID": version.short_id, "time": version.time, "message": version.message })
+}
+
+fn versions(params: &Params) -> Result<Vec<prompt_history::Version>, ApiError> {
+    list(params, "history")?
+        .into_iter()
+        .map(|item| {
+            let field = |key: &str| item.get(key).and_then(Value::as_str).unwrap_or("").to_string();
+            Ok(prompt_history::Version { id: field("id"), short_id: field("shortID"), time: field("time"), message: field("message") })
+        })
+        .collect()
 }
 
 fn override_id(params: &Params) -> Option<u64> {

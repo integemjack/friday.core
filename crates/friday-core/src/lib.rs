@@ -10,6 +10,7 @@ pub mod engines;
 pub mod folding;
 pub mod journal;
 pub mod line_diff;
+pub mod prompt_history;
 pub mod prompts;
 pub mod quota;
 pub mod secret_guard;

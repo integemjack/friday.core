@@ -36,7 +36,8 @@
 | 2 | 诊断日志（journal.json，整个存储，句柄，后台写盘）、引擎配置（engines.json 的读写格式） | `Agent/AgentJournal.swift`、`LLM/Engine/EngineStore.swift`；`agent/AgentJournal.cpp`、`llm/engine/EngineStore.cpp` | 完成 |
 | 3 | 其余存档（capabilities.json、jobs.json、mcp.json、工具和提供方的清单）：读写和各自的注册表搅在一起（迁移、原文原样保存），跟着各自的模块搬 | `Capabilities/`、`MCP/`、`Agent/ScriptTools`；`capabilities/`、`mcp/`、`agent/ScriptTools` | |
 | 2 | 提示词引擎（解析、展开参数和引用、装到数据目录、按段三方合并、校验、改一段、恢复成自带的、临时换一套段） | `Prompts/Prompts.swift`；`util/Prompts.cpp` | 完成（两端导出的全部提示词和旧实现逐字一样：`FRIDAY_PROMPT_DUMP`） |
-| 2 | 提示词的版本历史、回滚（PromptStore，调 git） | `Prompts/PromptStore.swift`；`models/PromptStore.cpp` | |
+| 2 | 提示词版本历史里两端都要的规则（git 设置、git log 解成版本、提交说明、自动回滚的判断、上次提交时用的段） | `Prompts/PromptStore.swift`；`models/PromptStore.cpp` | 完成 |
+| 4 | PromptStore 其余部分（跑 git、每秒看文件、停一会儿再提交、界面状态）：要核心能主动通知两端（段变了、git 跑完了），等事件回调 | 同上 | |
 | 3 | 工具定义（参数结构、权限）跟着工具执行一起搬 | `Agent/ToolRegistry.swift`、`AgentTools.swift`；`agent/` | |
 | 3 | 在线引擎：请求、流式解析、重试、限流排队 | `LLM/Engine/`；`llm/engine/` | |
 | 3 | 工具执行：文件、搜索、shell、MCP | `Agent/AgentTools*`、`MCP/`；`agent/`、`mcp/` | |
