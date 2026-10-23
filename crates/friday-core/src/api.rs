@@ -4,14 +4,15 @@
 //! code：`unknownMethod`（没有这个方法）、`invalidParams`（参数不对）、`internal`（核心里出错，C 接口层兜住的 panic 也报这个）。
 //! 时间一律用 Unix 毫秒（`now` 不传 = 现在），时长一律用秒（浮点）。
 //!
-//! 方法按模块分组（`quota.*`、`tools.*`、`secrets.*`、`vault.*`、`fold.*`、`conversations.*`、`diff.*`、`journal.*`、`engines.*`、`prompts.*`、`promptHistory.*`）。有状态的（`vault.*`、`journal.*`）先 open 拿句柄，后面的方法带上它，每个方法的参数和结果写在下面各自的函数上。
+//! 方法按模块分组（`quota.*`、`tools.*`、`secrets.*`、`vault.*`、`fold.*`、`conversations.*`、`diff.*`、`journal.*`、`engines.*`、`prompts.*`、`promptHistory.*`、`models.*`）。有状态的（`vault.*`、`journal.*`）先 open 拿句柄，后面的方法带上它，每个方法的参数和结果写在下面各自的函数上。
 
 use serde_json::{Map, Value, json};
 
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    conversations, engines, folding, journal, line_diff, prompt_history, prompts, quota, secret_guard, secret_store, tool_aliases,
+    conversations, engines, folding, journal, line_diff, model_traits, prompt_history, prompts, quota, secret_guard, secret_store,
+    tool_aliases,
 };
 
 #[derive(Debug)]
@@ -338,6 +339,33 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
             journal.clear();
             Value::Null
         }),
+        // {model, baseURL?, title?} → {tier, billing, isChat}（按模型名、接口地址、服务名推断；用户在高级设置里改过的两端自己用）
+        "models.traits" => {
+            let (model, base_url, title) = (string(params, "model")?, string(params, "baseURL")?, string(params, "title")?);
+            Ok(json!({
+                "tier": model_traits::infer_tier(&model),
+                "billing": model_traits::infer_billing(&base_url, &title, &model),
+                "isChat": model_traits::is_chat_model(&model),
+            }))
+        }
+        // {baseURL, model, sendsEnableThinking, thinking?} → {thinkingSupport, inferredThinking, nativeSwitch, isLocal, echoesReasoning,
+        //   asksParallelToolCalls, thinkingLevels}（thinking：用户设了的思考方式，没设按推断）
+        "engines.rules" => {
+            let (base_url, model) = (string(params, "baseURL")?, string(params, "model")?);
+            let sends = params.get("sendsEnableThinking").and_then(Value::as_bool).unwrap_or(false);
+            let inferred = engines::inferred_thinking(&base_url, sends);
+            let set = string(params, "thinking")?;
+            let support = if set.is_empty() { inferred.to_string() } else { set };
+            Ok(json!({
+                "thinkingSupport": support,
+                "inferredThinking": inferred,
+                "nativeSwitch": engines::native_switch(&base_url),
+                "isLocal": engines::is_local(&base_url),
+                "echoesReasoning": engines::echoes_reasoning(&base_url, &model),
+                "asksParallelToolCalls": engines::asks_parallel_tool_calls(&base_url),
+                "thinkingLevels": engines::thinking_levels(&support),
+            }))
+        }
         // {path} → [EngineConfig]（读 engines.json：缺的键补默认值，认不出的取值去掉）
         "engines.load" => to_value(engines::load(std::path::Path::new(&string(params, "path")?))),
         // {engines} → [EngineConfig]（同上，规整内存里的）

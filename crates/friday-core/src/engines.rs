@@ -99,6 +99,62 @@ impl EngineConfig {
     }
 }
 
+// MARK: - 推断规则
+
+/// 本机的服务（本地大模型、Ollama、LM Studio）
+pub fn is_local(base_url: &str) -> bool {
+    let url = base_url.to_lowercase();
+    if url.starts_with("power://") {
+        return true;
+    }
+    crate::model_traits::url_host(&url).is_some_and(|host| ["localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0"].contains(&host.as_str()))
+}
+
+/// 没手动设置时的思考方式（none / toggle / effort / thinkingType）。v2.76 起在线的一律分档（用户 2026-10-23「在线模型默认接入时就应该用分档」）：
+/// 只认自己开关的几家分档时照样带上它们的开关（native_switch），接口不认 reasoning_effort 的按 v1.20 自动去掉；本机的不猜
+pub fn inferred_thinking(base_url: &str, sends_enable_thinking: bool) -> &'static str {
+    if sends_enable_thinking {
+        "toggle"
+    } else if is_local(base_url) {
+        "none"
+    } else {
+        "effort"
+    }
+}
+
+/// v2.76 接口自己的思考开关（智谱、方舟的 thinking.type，百炼、硅基流动的 enable_thinking）：分档时一起带，
+/// 「关」才真关得掉（智谱默认想），通义这种默认不想的选了档才会想
+pub fn native_switch(base_url: &str) -> Option<&'static str> {
+    let host = base_url.to_lowercase();
+    if host.contains("bigmodel.cn") || host.contains("volces.com") {
+        Some("thinkingType")
+    } else if host.contains("dashscope") || host.contains("qianwenaiapi") || host.contains("siliconflow") {
+        Some("toggle")
+    } else {
+        None
+    }
+}
+
+/// 接口要求把每段的 reasoning_content 原样带回（DeepSeek 的思考模式带工具调用时，少了会报错）：折叠较早的步骤时也不去掉
+pub fn echoes_reasoning(base_url: &str, model: &str) -> bool {
+    format!("{base_url} {model}").to_lowercase().contains("deepseek")
+}
+
+/// 带工具的请求要明说 parallel_tool_calls: true：百炼（含 Token Plan）兼容接口的参数表写它默认 false（不开并行）
+pub fn asks_parallel_tool_calls(base_url: &str) -> bool {
+    let host = base_url.to_lowercase();
+    host.contains("dashscope") || host.contains("qianwenaiapi")
+}
+
+/// 这种思考方式可选的档位（off / low / medium / high；超级模式由智能体加在会话的选项后面）
+pub fn thinking_levels(support: &str) -> &'static [&'static str] {
+    match support {
+        "toggle" | "thinkingType" => &["off", "medium"],
+        "effort" => &["off", "low", "medium", "high"],
+        _ => &[],
+    }
+}
+
 /// 规整一组引擎（不是对象的跳过）
 pub fn normalize(items: Vec<Value>) -> Vec<EngineConfig> {
     items
@@ -161,6 +217,26 @@ mod tests {
         assert!(written[2].get("thinking").is_none() && written[2].get("tier").is_none() && written[2].get("billing").is_none());
         assert_eq!(written[2]["disabled"], json!(true));
         assert!(written[2].get("visionChecked").is_none());
+    }
+
+    #[test]
+    fn rules() {
+        assert!(is_local("power://llm") && is_local("http://127.0.0.1:8080/v1") && is_local("http://[::1]:11434"));
+        assert!(!is_local("https://api.deepseek.com") && !is_local("http://mac.local:1234"));
+        assert_eq!(inferred_thinking("https://api.openai.com/v1", false), "effort");
+        assert_eq!(inferred_thinking("http://localhost:11434/v1", false), "none");
+        assert_eq!(inferred_thinking("http://localhost:11434/v1", true), "toggle");
+        assert_eq!(native_switch("https://open.bigmodel.cn/api/paas/v4"), Some("thinkingType"));
+        assert_eq!(native_switch("https://ark.cn-beijing.volces.com/api/v3"), Some("thinkingType"));
+        assert_eq!(native_switch("https://dashscope.aliyuncs.com/compatible-mode/v1"), Some("toggle"));
+        assert_eq!(native_switch("https://api.siliconflow.cn/v1"), Some("toggle"));
+        assert_eq!(native_switch("https://api.openai.com/v1"), None);
+        assert!(echoes_reasoning("https://api.deepseek.com/v1", "deepseek-chat") && echoes_reasoning("https://x", "DeepSeek-R1"));
+        assert!(!echoes_reasoning("https://open.bigmodel.cn", "glm-5"));
+        assert!(asks_parallel_tool_calls("https://token-plan.cn-beijing.maas.qianwenaiapi.com/v1"));
+        assert_eq!(thinking_levels("effort"), ["off", "low", "medium", "high"]);
+        assert_eq!(thinking_levels("thinkingType"), ["off", "medium"]);
+        assert!(thinking_levels("none").is_empty());
     }
 
     #[test]
