@@ -12,10 +12,10 @@ use std::collections::{HashMap, HashSet};
 
 use crate::chat_models::Conversation;
 use crate::{
-    agents, archive, chat_request, chat_stream, chooser, context, conversations, delivery, engine_loop, engines, events, file_changes,
-    file_edit, file_search, folding, gate, journal, line_diff, liveness, mcp_client, mcp_config, model_traits, prompt_history,
-    prompt_store, prompts, quota, repetition, secret_guard, secret_store, shell_rules, swift_json, task_state, team, tool_aliases,
-    tool_defs, tool_files,
+    agents, approval, archive, chat_request, chat_stream, chooser, context, conversations, delivery, engine_loop, engines, events,
+    file_changes, file_edit, file_search, folding, gate, journal, line_diff, liveness, mcp_client, mcp_config, model_traits,
+    prompt_history, prompt_store, prompts, quota, repetition, secret_guard, secret_store, shell_rules, swift_json, task_state, team,
+    tool_aliases, tool_defs, tool_files,
 };
 
 #[derive(Debug)]
@@ -487,6 +487,40 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
         "taskState.classify" => {
             let text = string(params, "text")?;
             Ok(json!({ "requirement": task_state::looks_like_requirement(&text), "rule": task_state::looks_like_rule(&text) }))
+        }
+        // {name, command?, path?, alwaysConfirm, paid, mode: auto|plan|full, permissionNeedsApproval, stopsSystem, browserStop, powerShell?}
+        //   → {needed, forced}（一个调用要不要先问用户；powerShell 不传按这台是不是 Windows）
+        "approval.decide" => {
+            let text = |key: &str| params.get(key).and_then(Value::as_str).map(str::to_string);
+            let (name, command, path, mode) =
+                (string(params, "name")?, text("command"), text("path"), text("mode").unwrap_or_else(|| "auto".into()));
+            let request = approval::Request {
+                name: &name,
+                command: command.as_deref(),
+                path: path.as_deref(),
+                always_confirm: flag(params, "alwaysConfirm"),
+                paid: flag(params, "paid"),
+                mode: &mode,
+                permission_needs_approval: flag(params, "permissionNeedsApproval"),
+                stops_system: flag(params, "stopsSystem"),
+                browser_stop: flag(params, "browserStop"),
+                power_shell: params.get("powerShell").and_then(Value::as_bool).unwrap_or(cfg!(windows)),
+            };
+            let (needed, forced) = approval::decide(&request);
+            Ok(json!({ "needed": needed, "forced": forced }))
+        }
+        // {name, command?, path?, powerShell?} → {destructive, systemChange}；{command} 也给 {systemCommand}，{path} 给 {systemPath}
+        "approval.classify" => {
+            let text = |key: &str| params.get(key).and_then(Value::as_str).map(str::to_string);
+            let (name, command, path) = (text("name").unwrap_or_default(), text("command"), text("path"));
+            let power_shell = params.get("powerShell").and_then(Value::as_bool).unwrap_or(cfg!(windows));
+            Ok(json!({
+                "destructive": approval::is_destructive(&name, command.as_deref(), power_shell),
+                "destructiveCommand": command.as_deref().is_some_and(|command| approval::is_destructive_command(command, power_shell)),
+                "systemChange": approval::is_system_change(&name, command.as_deref(), path.as_deref()),
+                "systemCommand": command.as_deref().is_some_and(approval::is_system_command),
+                "systemPath": path.as_deref().is_some_and(approval::is_system_path),
+            }))
         }
         // {items: [{role, task, engine}], attempts: [{id, name, role, task, engine}], running: [{id, name, role, assignment}], single?, own?}
         //   （single、own：只派一个下级时它的任务和调用方自己的任务）

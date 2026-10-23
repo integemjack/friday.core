@@ -5,6 +5,7 @@
 
 pub mod agents;
 pub mod api;
+pub mod approval;
 pub mod archive;
 pub mod chat_models;
 pub mod chat_request;
