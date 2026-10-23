@@ -9,6 +9,7 @@ pub mod archive;
 pub mod chat_models;
 pub mod chat_request;
 pub mod chat_stream;
+pub mod chooser;
 pub mod context;
 pub mod conversations;
 pub mod delivery;

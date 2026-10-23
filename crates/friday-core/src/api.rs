@@ -12,9 +12,10 @@ use std::collections::{HashMap, HashSet};
 
 use crate::chat_models::Conversation;
 use crate::{
-    agents, archive, chat_request, chat_stream, context, conversations, delivery, engine_loop, engines, events, file_changes, file_edit,
-    file_search, folding, gate, journal, line_diff, liveness, mcp_client, mcp_config, model_traits, prompt_history, prompt_store, prompts,
-    quota, repetition, secret_guard, secret_store, shell_rules, swift_json, task_state, tool_aliases, tool_defs, tool_files,
+    agents, archive, chat_request, chat_stream, chooser, context, conversations, delivery, engine_loop, engines, events, file_changes,
+    file_edit, file_search, folding, gate, journal, line_diff, liveness, mcp_client, mcp_config, model_traits, prompt_history,
+    prompt_store, prompts, quota, repetition, secret_guard, secret_store, shell_rules, swift_json, task_state, tool_aliases, tool_defs,
+    tool_files,
 };
 
 #[derive(Debug)]
@@ -315,6 +316,43 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
             Ok(spec) => spec,
             Err(failure) => json!({ "failure": failure }),
         }),
+        // {pool: [{id, tier, billing, isChat?, vision?, usable?}], tier, preferred?, preferVision?} → 挑中的 id 或 null
+        "models.pick" => {
+            let pool = candidates(params, "pool")?;
+            let preferred = params.get("preferred").and_then(Value::as_str).map(str::to_string);
+            let index = chooser::pick(&pool, &string(params, "tier")?, preferred.as_deref(), flag(params, "preferVision"));
+            Ok(json!(index.map(|index| pool[index].id.clone())))
+        }
+        // {pool} → 小活用的快模型 id 或 null
+        "models.pickLight" => {
+            let pool = candidates(params, "pool")?;
+            Ok(json!(chooser::pick_light(&pool).map(|index| pool[index].id.clone())))
+        }
+        // {wanted?, work?, cap, levels?} → 子智能体的深度思考档位
+        "models.thinking" => {
+            let text = |key: &str| params.get(key).and_then(Value::as_str).map(str::to_string);
+            let levels = if params.contains_key("levels") { string_list(params, "levels")? } else { Vec::new() };
+            Ok(json!(chooser::thinking(text("wanted").as_deref(), text("work").as_deref(), &string(params, "cap")?, &levels)))
+        }
+        // {work?, mainTier?} → 子智能体挑哪一档
+        "models.subAgentTier" => {
+            let text = |key: &str| params.get(key).and_then(Value::as_str).map(str::to_string);
+            Ok(json!(chooser::sub_agent_tier(text("work").as_deref(), text("mainTier").as_deref())))
+        }
+        // {mode, engines: [{id, title, model, tier, billing, isChat, vision, usable, disabled, power}], allowed: [同上], current?, requested?, work?, hasEnabled}
+        //   → {engine} | {failure, kind: invalid | failed}（子智能体用哪个大脑）
+        "agents.chooseEngine" => {
+            let text = |key: &str| params.get(key).and_then(Value::as_str).map(str::to_string);
+            Ok(chooser::choose_engine(
+                &text("mode").unwrap_or_default(),
+                &candidates(params, "engines")?,
+                &candidates(params, "allowed")?,
+                text("current").as_deref(),
+                text("requested").as_deref(),
+                text("work").as_deref(),
+                flag(params, "hasEnabled"),
+            ))
+        }
         // {text} → look / change / hard 或 null（说的活的种类，中文也认）
         "agents.parseWork" => Ok(json!(agents::parse_work(&string(params, "text")?))),
         // {text} → off / low / medium / high 或 null（深度思考，中文也认）
@@ -1646,6 +1684,10 @@ fn user_messages(params: &Params) -> Result<Vec<task_state::UserMessage>, ApiErr
                 .collect(),
         })
         .collect())
+}
+
+fn candidates(params: &Params, key: &str) -> Result<Vec<chooser::Candidate>, ApiError> {
+    Ok(list(params, key)?.iter().map(chooser::Candidate::from_json).collect())
 }
 
 fn conversations_of(params: &Params, key: &str) -> Result<Vec<Conversation>, ApiError> {
