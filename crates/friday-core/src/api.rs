@@ -4,13 +4,13 @@
 //! code：`unknownMethod`（没有这个方法）、`invalidParams`（参数不对）、`internal`（核心里出错，C 接口层兜住的 panic 也报这个）。
 //! 时间一律用 Unix 毫秒（`now` 不传 = 现在），时长一律用秒（浮点）。
 //!
-//! 方法按模块分组（`quota.*`、`tools.*`、`secrets.*`、`vault.*`、`fold.*`、`conversations.*`、`diff.*`）。有状态的（`vault.*`）先 open 拿句柄，后面的方法带上它，每个方法的参数和结果写在下面各自的函数上。
+//! 方法按模块分组（`quota.*`、`tools.*`、`secrets.*`、`vault.*`、`fold.*`、`conversations.*`、`diff.*`、`journal.*`、`engines.*`）。有状态的（`vault.*`、`journal.*`）先 open 拿句柄，后面的方法带上它，每个方法的参数和结果写在下面各自的函数上。
 
 use serde_json::{Map, Value, json};
 
 use std::collections::{HashMap, HashSet};
 
-use crate::{conversations, folding, line_diff, quota, secret_guard, secret_store, tool_aliases};
+use crate::{conversations, engines, folding, journal, line_diff, quota, secret_guard, secret_store, tool_aliases};
 
 #[derive(Debug)]
 pub struct ApiError {
@@ -53,6 +53,11 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
     match method {
         // {} → {"version": "0.1.0", "abi": 1}
         "core.version" => Ok(json!({ "version": crate::VERSION, "abi": crate::ABI_VERSION })),
+        // {} → null（等后台排着的写盘都写完；两端退出前调）
+        "core.flush" => {
+            crate::writer::flush();
+            Ok(Value::Null)
+        }
 
         // {status, body} → "rateLimit" | "usage" | "balance" | "denied" | null
         "quota.classify" => {
@@ -306,6 +311,43 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
             Ok(Value::from(line_diff::line_hashes(&string(params, "text")?).into_iter().map(line_diff::hex).collect::<Vec<_>>()))
         }
 
+        // {directory?} → {journal}（打开数据目录里的 journal.json；不给 directory：只在内存里）
+        "journal.open" => {
+            let directory = string(params, "directory")?;
+            Ok(json!({ "journal": journal::open((!directory.is_empty()).then(|| std::path::Path::new(&directory))) }))
+        }
+        // {journal} → null
+        "journal.close" => {
+            journal::close(handle(params, "journal")?);
+            Ok(Value::Null)
+        }
+        // {journal, kind, title, detail} → 记下没有（kind：tool / framework / mcp / recovered；detail 截到 3000 字）
+        "journal.record" => {
+            let (kind, title, detail) = (string(params, "kind")?, string(params, "title")?, string(params, "detail")?);
+            journal_of(params, |journal| Value::from(journal.record(&kind, &title, &detail)))
+        }
+        // {journal, limit?} → [{id, date, kind, title, detail}]（新的在前）
+        "journal.entries" => {
+            let limit = params.get("limit").and_then(Value::as_u64).map(|limit| limit as usize);
+            journal_of(params, |journal| Value::from(journal.entries(limit).to_vec()))
+        }
+        // {journal} → null
+        "journal.clear" => journal_of(params, |journal| {
+            journal.clear();
+            Value::Null
+        }),
+        // {path} → [EngineConfig]（读 engines.json：缺的键补默认值，认不出的取值去掉）
+        "engines.load" => to_value(engines::load(std::path::Path::new(&string(params, "path")?))),
+        // {engines} → [EngineConfig]（同上，规整内存里的）
+        "engines.normalize" => to_value(engines::normalize(list(params, "engines")?)),
+        // {path, engines} → [EngineConfig]（规整后写进 engines.json，返回写下的）
+        "engines.save" => {
+            let normalized = engines::normalize(list(params, "engines")?);
+            engines::save(std::path::Path::new(&string(params, "path")?), &normalized)
+                .map_err(|error| ApiError { code: "internal", message: format!("写 engines.json 失败：{error}") })?;
+            to_value(normalized)
+        }
+
         // {} → 主会话折叠的预算（估算 token；子 Agent 会话是它的两倍）
         "fold.budget" => Ok(Value::from(folding::BUDGET)),
         // {text} → 较早的回复正文的摘要
@@ -385,6 +427,19 @@ fn hashes(params: &Params, key: &str) -> Result<Vec<u64>, ApiError> {
         .iter()
         .map(|text| line_diff::parse_hex(text).ok_or_else(|| ApiError::invalid(format!("{key} 里要是 16 位十六进制的指纹：{text}"))))
         .collect()
+}
+
+fn handle(params: &Params, key: &str) -> Result<u64, ApiError> {
+    params.get(key).and_then(Value::as_u64).ok_or_else(|| ApiError::invalid(format!("缺少 {key}（open 返回的句柄）")))
+}
+
+fn journal_of(params: &Params, body: impl FnOnce(&mut journal::Journal) -> Value) -> Result<Value, ApiError> {
+    let id = handle(params, "journal")?;
+    journal::with(id, body).ok_or_else(|| ApiError::invalid(format!("没有这个日志句柄：{id}（关掉了？）")))
+}
+
+fn to_value(value: impl serde::Serialize) -> Result<Value, ApiError> {
+    serde_json::to_value(value).map_err(|error| ApiError { code: "internal", message: error.to_string() })
 }
 
 fn string_map(params: &Params, key: &str) -> Result<HashMap<String, String>, ApiError> {
@@ -560,6 +615,19 @@ mod tests {
         assert_eq!(parsed("diff.countHashes", r#"{"a":["xyz"],"b":[]}"#)["error"]["code"], json!("invalidParams"));
         let lines = parsed("diff.lines", r#"{"old":"","new":"x\n"}"#);
         assert_eq!(lines["result"], json!([{ "op": "added", "oldLine": 0, "newLine": 1, "text": "x" }]));
+    }
+
+    #[test]
+    fn journal_and_engines_methods() {
+        let id = parsed("journal.open", "{}")["result"]["journal"].as_u64().unwrap();
+        let params = json!({ "journal": id, "kind": "framework", "title": "t", "detail": "d" });
+        assert_eq!(parsed("journal.record", &params.to_string())["result"], json!(true));
+        let entries = parsed("journal.entries", &json!({ "journal": id, "limit": 5 }).to_string());
+        assert_eq!(entries["result"][0]["title"], json!("t"));
+        parsed("journal.close", &json!({ "journal": id }).to_string());
+        assert_eq!(parsed("journal.entries", &json!({ "journal": id }).to_string())["error"]["code"], json!("invalidParams"));
+        let engines = parsed("engines.normalize", r#"{"engines":[{"id":"e","title":"t"}]}"#);
+        assert_eq!(engines["result"][0]["model"], json!("gpt-4o-mini"));
     }
 
     #[test]

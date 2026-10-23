@@ -17,7 +17,8 @@
    存档文件由核心读写，写法照两端原来的（`swift_json::pretty`：Swift JSONEncoder 的 pretty + 键排序），降级回旧版也读得了。
 10. 热路径上的小函数（要对大量数据反复调、本身只有几行的：给整个工作目录算行指纹、界面每次画都要算的合计）可以两端各留一份，
     但核心也要有同样的实现，并在三边的测试里用同一组值对照。64 位的数过 C 接口写成十六进制字符串（JSON 的数字只有 53 位精度）。
-11. Swift 传 `JSONValue` 这类 Codable 值用 `CoreBridge.call(_:encoding:as:)`，不经过 `Any`（整数和小数不会混）。
+11. 频繁、文件大的写盘交给核心的后台写盘（`writer`：同一个文件只写最新的那份），不在调用方的线程上写；两端退出前调 `core.flush`。
+12. Swift 传 `JSONValue` 这类 Codable 值用 `CoreBridge.call(_:encoding:as:)`，不经过 `Any`（整数和小数不会混）。
 
 ## 顺序
 
@@ -32,7 +33,8 @@
 | 1 | 等额度的文案和时间（等到什么时候、消息上那一行、时间和「还有多久」的写法；停下、换大脑、定时检查留在两端） | `Agent/QuotaWaiting.swift`；`agent/QuotaWaiting.cpp` | 完成 |
 | 2 | 会话数据模型（Conversation、ChatMessage、MessageBlock、ToolEvent……，JSON 和 Swift Codable 一致，认不出的字段原样保留）+ 读 conversations.json 时的规整（旧存档补父子链、上次中途退出的标成中断、按更新时间排） | `Models/ChatModels.swift`、`ConversationStore.swift` 的读入；`models/ChatModels.cpp`、`ConversationStore.cpp` 的 loadFromDisk | 完成（核心只把用到的字段定成类型，其余在 extra 里；本机 8 MB 真实存档往返一字不差：`cargo run --release --example check_archive <文件>`） |
 | 2 | 改文件的增删行数（LineDiff：Myers 按全文 / 按指纹算、改动视图；分行和行指纹两端各留一份，热路径，三边有对照测试） | `Models/LineDiff.swift`；`models/LineDiff.cpp` | 完成 |
-| 2 | 日志（journal.json）、引擎配置（engines.json）等其余存档的格式 | 各自模块 | |
+| 2 | 诊断日志（journal.json，整个存储，句柄，后台写盘）、引擎配置（engines.json 的读写格式） | `Agent/AgentJournal.swift`、`LLM/Engine/EngineStore.swift`；`agent/AgentJournal.cpp`、`llm/engine/EngineStore.cpp` | 完成 |
+| 3 | 其余存档（capabilities.json、jobs.json、mcp.json、工具和提供方的清单）：读写和各自的注册表搅在一起（迁移、原文原样保存），跟着各自的模块搬 | `Capabilities/`、`MCP/`、`Agent/ScriptTools`；`capabilities/`、`mcp/`、`agent/ScriptTools` | |
 | 2 | 提示词拼装、工具定义 | `Prompts/`、`Agent/ToolRegistry.swift`；`agent/` | |
 | 3 | 在线引擎：请求、流式解析、重试、限流排队 | `LLM/Engine/`；`llm/engine/` | |
 | 3 | 工具执行：文件、搜索、shell、MCP | `Agent/AgentTools*`、`MCP/`；`agent/`、`mcp/` | |

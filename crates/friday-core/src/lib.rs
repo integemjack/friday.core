@@ -6,13 +6,16 @@
 pub mod api;
 pub mod chat_models;
 pub mod conversations;
+pub mod engines;
 pub mod folding;
+pub mod journal;
 pub mod line_diff;
 pub mod quota;
 pub mod secret_guard;
 pub mod secret_store;
 pub mod swift_json;
 pub mod tool_aliases;
+pub mod writer;
 
 /// 版本号（== Cargo.toml 的 workspace.package.version）
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
