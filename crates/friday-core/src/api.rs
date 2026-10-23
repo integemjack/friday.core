@@ -14,8 +14,8 @@ use crate::chat_models::Conversation;
 use crate::{
     agents, approval, archive, capability_store, chat_request, chat_stream, chooser, context, conversations, delivery, engine_loop,
     engines, events, file_changes, file_edit, file_search, folding, gate, journal, line_diff, liveness, mcp_client, mcp_config,
-    model_traits, prompt_history, prompt_store, prompts, quota, repetition, script_tools, secret_guard, secret_store, shell_rules,
-    swift_json, task_state, team, tool_aliases, tool_defs, tool_files,
+    model_traits, prompt_history, prompt_store, prompts, provider_store, quota, repetition, script_tools, secret_guard, secret_store,
+    shell_rules, swift_json, task_state, team, tool_aliases, tool_defs, tool_files,
 };
 
 #[derive(Debug)]
@@ -506,6 +506,54 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
                 Err(failure) => json!({ "failure": failure }),
             })
         }
+        // {id} → 提供方 id 合不合法
+        "providers.isValidID" => Ok(json!(provider_store::is_valid_id(&string(params, "id")?))),
+        // {manifest} → 补默认值的清单 | {failure}（provider.json）
+        "providers.normalize" => Ok(match provider_store::normalize(&object(params, "manifest")?) {
+            Ok(manifest) => Value::Object(manifest),
+            Err(failure) => json!({ "failure": failure }),
+        }),
+        // {manifest, builtins, catalog} → 清单说不通的地方或 null
+        "providers.problem" => Ok(json!(provider_store::problem(
+            &object(params, "manifest")?,
+            &string_list(params, "builtins")?,
+            &string_list(params, "catalog")?
+        ))),
+        // {root} → {packages: [{manifest, code, directory}], problems}
+        "providers.loadAll" => Ok(provider_store::load_all(std::path::Path::new(&string(params, "root")?))),
+        // {directory} → {manifest, code, directory} | {failure}
+        "providers.read" => Ok(provider_store::read(std::path::Path::new(&string(params, "directory")?))
+            .unwrap_or_else(|failure| json!({ "failure": failure }))),
+        // {root, manifest, code} → {manifest, code, directory} | {failure}（存新版本，旧的归档）
+        "providers.save" => {
+            Ok(provider_store::save(std::path::Path::new(&string(params, "root")?), &object(params, "manifest")?, &string(params, "code")?)
+                .unwrap_or_else(|failure| json!({ "failure": failure })))
+        }
+        // {root, manifest} → null | {failure}（只更新清单）
+        "providers.updateManifest" => {
+            Ok(match provider_store::update_manifest(std::path::Path::new(&string(params, "root")?), &object(params, "manifest")?) {
+                Ok(()) => Value::Null,
+                Err(failure) => json!({ "failure": failure }),
+            })
+        }
+        // {folder, sourceName} → {folder} | {failure}（解开的包里 provider.json 在哪一层）
+        "providers.locate" => {
+            Ok(match provider_store::locate(std::path::Path::new(&string(params, "folder")?), &string(params, "sourceName")?) {
+                Ok(folder) => json!({ "folder": folder.to_string_lossy() }),
+                Err(failure) => json!({ "failure": failure }),
+            })
+        }
+        // {root, folder, sourceName, builtins, catalog} → {package, replaced} | {failure}（导入解开的包）
+        "providers.install" => Ok(provider_store::install(
+            std::path::Path::new(&string(params, "root")?),
+            std::path::Path::new(&string(params, "folder")?),
+            &string(params, "sourceName")?,
+            &string_list(params, "builtins")?,
+            &string_list(params, "catalog")?,
+        )
+        .unwrap_or_else(|failure| json!({ "failure": failure }))),
+        // {manifest} → 导出用的 provider.json 文本（不带自测结果）
+        "providers.exportManifest" => Ok(json!(provider_store::export_manifest(&object(params, "manifest")?))),
         // {manifest} → 补全默认值的清单或 null（脚本工具的 tool.json）
         "scriptTools.normalize" => Ok(json!(script_tools::normalize_manifest(&object(params, "manifest")?))),
         // {name} → 工具名合不合法

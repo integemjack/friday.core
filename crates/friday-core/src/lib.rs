@@ -32,6 +32,7 @@ pub mod model_traits;
 pub mod prompt_history;
 pub mod prompt_store;
 pub mod prompts;
+pub mod provider_store;
 pub mod quota;
 pub mod repetition;
 pub mod script_tools;
