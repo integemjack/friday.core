@@ -4,15 +4,15 @@
 //! code：`unknownMethod`（没有这个方法）、`invalidParams`（参数不对）、`internal`（核心里出错，C 接口层兜住的 panic 也报这个）。
 //! 时间一律用 Unix 毫秒（`now` 不传 = 现在），时长一律用秒（浮点）。
 //!
-//! 方法按模块分组（`quota.*`、`tools.*`、`secrets.*`、`vault.*`、`fold.*`、`conversations.*`、`diff.*`、`journal.*`、`engines.*`、`prompts.*`、`promptHistory.*`、`models.*`）。有状态的（`vault.*`、`journal.*`）先 open 拿句柄，后面的方法带上它，每个方法的参数和结果写在下面各自的函数上。
+//! 方法按模块分组（`quota.*`、`tools.*`、`secrets.*`、`vault.*`、`fold.*`、`conversations.*`、`diff.*`、`journal.*`、`engines.*`、`prompts.*`、`promptHistory.*`、`models.*`、`stream.*`、`repetition.*`）。有状态的（`vault.*`、`journal.*`、`stream.*`）先 open 拿句柄，后面的方法带上它，每个方法的参数和结果写在下面各自的函数上。
 
 use serde_json::{Map, Value, json};
 
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    conversations, engines, folding, journal, line_diff, model_traits, prompt_history, prompts, quota, secret_guard, secret_store,
-    tool_aliases,
+    chat_stream, conversations, engines, folding, journal, line_diff, model_traits, prompt_history, prompts, quota, repetition,
+    secret_guard, secret_store, tool_aliases,
 };
 
 #[derive(Debug)]
@@ -339,6 +339,47 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
             journal.clear();
             Value::Null
         }),
+        // {showReasoning, quota} → {stream}（一段请求一个；quota：流里的报错要不要按额度用完认）
+        "stream.open" => {
+            let flag = |key: &str| params.get(key).and_then(Value::as_bool).unwrap_or(false);
+            Ok(json!({ "stream": chat_stream::open(flag("showReasoning"), flag("quota")) }))
+        }
+        // {stream} → null
+        "stream.close" => {
+            chat_stream::close(handle(params, "stream")?);
+            Ok(Value::Null)
+        }
+        // {chunk, stream, now?} → {chunks?, argumentsDelta?, firstToken?, loop?, error?: {kind: quota | rateLimit | failed, message,
+        // limit?, resetSeconds?}}（chunk 是 SSE data: 的负载原样嵌进来；空的字段不写；loop / error：不再往下读）
+        "stream.feed" => {
+            let now = now(params)?;
+            let chunk = params.get("chunk").unwrap_or(&Value::Null);
+            stream_of(params, |parser| parser.feed(chunk, now).to_json())
+        }
+        // {stream} → {content, reasoning, toolCalls: [{id, name, arguments}], promptTokens, completionTokens, cachedTokens, finishReason,
+        // loop: {start, unit, inReasoning} | null, inReasoning}（读完、停下、出错都能取；start 是 UTF-16 下标）
+        "stream.finish" => stream_of(params, |parser| parser.result()),
+        // {finishReason?, sawDone} → {transient, message} | null（流读完之后看是不是其实被掐断了）
+        "stream.interrupted" => {
+            let reason = string(params, "finishReason")?;
+            let saw_done = params.get("sawDone").and_then(Value::as_bool).unwrap_or(false);
+            Ok(chat_stream::interrupted(Some(&reason), saw_done)
+                .map_or(Value::Null, |(transient, message)| json!({ "transient": transient, "message": message })))
+        }
+        // {error} → 流里的 error 对象是不是限流
+        "stream.isRateLimit" => Ok(Value::from(chat_stream::is_rate_limit(&object(params, "error")?))),
+        // {usage} → 命中缓存的输入 token | null
+        "stream.cachedTokens" => Ok(chat_stream::cached_tokens(&object(params, "usage")?).map_or(Value::Null, Value::from)),
+        // {text, minPeriod, copies} → {start, unit} | null（末尾连着复读；start 是 UTF-16 下标）
+        "repetition.trailingLoop" => {
+            let (min_period, copies) = (int(params, "minPeriod")?.max(0) as usize, int(params, "copies")?.max(0) as usize);
+            Ok(repetition::trailing_loop_in(&string(params, "text")?, min_period, copies)
+                .map_or(Value::Null, |found| json!({ "start": found.start, "unit": found.unit })))
+        }
+        // {text, earlier: [文字]} → 和之前几步说差不多的话的次数
+        "repetition.similarCount" => Ok(Value::from(repetition::similar_count(&string(params, "text")?, &string_list(params, "earlier")?))),
+        // {a, b} → 相似度（0–1）
+        "repetition.similarity" => Ok(Value::from(repetition::similarity(&string(params, "a")?, &string(params, "b")?))),
         // {model, baseURL?, title?} → {tier, billing, isChat}（按模型名、接口地址、服务名推断；用户在高级设置里改过的两端自己用）
         "models.traits" => {
             let (model, base_url, title) = (string(params, "model")?, string(params, "baseURL")?, string(params, "title")?);
@@ -578,6 +619,11 @@ fn journal_of(params: &Params, body: impl FnOnce(&mut journal::Journal) -> Value
     journal::with(id, body).ok_or_else(|| ApiError::invalid(format!("没有这个日志句柄：{id}（关掉了？）")))
 }
 
+fn stream_of(params: &Params, body: impl FnOnce(&mut chat_stream::Parser) -> Value) -> Result<Value, ApiError> {
+    let id = handle(params, "stream")?;
+    chat_stream::with(id, body).ok_or_else(|| ApiError::invalid(format!("没有这个流句柄：{id}（关掉了？）")))
+}
+
 fn to_value(value: impl serde::Serialize) -> Result<Value, ApiError> {
     serde_json::to_value(value).map_err(|error| ApiError { code: "internal", message: error.to_string() })
 }
@@ -799,5 +845,26 @@ mod tests {
         assert_eq!(changed["result"], json!({"path": "a"}));
         assert_eq!(parsed("tools.canonicalArguments", r#"{"name":"read_file","arguments":{"path":"a"}}"#)["result"], Value::Null);
         assert_eq!(parsed("tools.canonicalArguments", r#"{"name":"x","arguments":[]}"#)["error"]["code"], json!("invalidParams"));
+    }
+
+    /// 两端把 SSE 的负载原样拼进参数：{"chunk":<负载>,"stream":N}——句柄写在最后，负载里夹带的 "stream" 盖不掉它，坏的负载整个不认
+    #[test]
+    fn stream_handle() {
+        let id = parsed("stream.open", r#"{"showReasoning":true,"quota":true}"#)["result"]["stream"].as_u64().unwrap();
+        let feed = |payload: &str| parsed("stream.feed", &format!(r#"{{"chunk":{payload},"stream":{id}}}"#));
+        assert_eq!(feed(r#"{"choices":[{"delta":{"content":"你好"}}]}"#)["result"], json!({"chunks": ["你好"], "firstToken": true}));
+        assert_eq!(feed(r#"{"choices":[{"delta":{"content":"！"}}]}"#)["result"], json!({"chunks": ["！"]}));
+        assert_eq!(feed(r#"{"choices":[{"delta":{"content":"x"}}]},"stream":999999"#)["result"], json!({"chunks": ["x"]}));
+        assert_eq!(feed(r#"{"choices":[{"#)["error"]["code"], json!("invalidParams"));
+        let error = feed(r#"{"error":{"message":"KV 池满了","code":"429"}}"#)["result"]["error"].clone();
+        assert_eq!(error, json!({"kind": "rateLimit", "message": "KV 池满了"}));
+        let result = parsed("stream.finish", &json!({ "stream": id }).to_string())["result"].clone();
+        assert_eq!(result["content"], "你好！x");
+        assert_eq!(result["finishReason"], Value::Null);
+        assert_eq!(parsed("stream.interrupted", r#"{"sawDone":false}"#)["result"]["transient"], json!(true));
+        assert_eq!(parsed("stream.interrupted", r#"{"finishReason":"stop","sawDone":false}"#)["result"], Value::Null);
+        parsed("stream.close", &json!({ "stream": id }).to_string());
+        assert_eq!(parsed("stream.finish", &json!({ "stream": id }).to_string())["error"]["code"], json!("invalidParams"));
+        assert_eq!(parsed("repetition.similarity", r#"{"a":"abcd","b":"abcd"}"#)["result"], json!(1.0));
     }
 }

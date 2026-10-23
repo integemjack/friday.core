@@ -5,6 +5,7 @@
 
 pub mod api;
 pub mod chat_models;
+pub mod chat_stream;
 pub mod conversations;
 pub mod engines;
 pub mod folding;
@@ -14,6 +15,7 @@ pub mod model_traits;
 pub mod prompt_history;
 pub mod prompts;
 pub mod quota;
+pub mod repetition;
 pub mod secret_guard;
 pub mod secret_store;
 pub mod swift_json;
