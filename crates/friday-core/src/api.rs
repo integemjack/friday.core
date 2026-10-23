@@ -14,8 +14,8 @@ use crate::chat_models::Conversation;
 use crate::{
     agents, archive, chat_request, chat_stream, chooser, context, conversations, delivery, engine_loop, engines, events, file_changes,
     file_edit, file_search, folding, gate, journal, line_diff, liveness, mcp_client, mcp_config, model_traits, prompt_history,
-    prompt_store, prompts, quota, repetition, secret_guard, secret_store, shell_rules, swift_json, task_state, tool_aliases, tool_defs,
-    tool_files,
+    prompt_store, prompts, quota, repetition, secret_guard, secret_store, shell_rules, swift_json, task_state, team, tool_aliases,
+    tool_defs, tool_files,
 };
 
 #[derive(Debug)]
@@ -488,6 +488,23 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
             let text = string(params, "text")?;
             Ok(json!({ "requirement": task_state::looks_like_requirement(&text), "rule": task_state::looks_like_rule(&text) }))
         }
+        // {items: [{role, task, engine}], attempts: [{id, name, role, task, engine}], running: [{id, name, role, assignment}], single?, own?}
+        //   （single、own：只派一个下级时它的任务和调用方自己的任务）
+        //   → 不通过时给模型看的说明或 null（派发前的检查）
+        "team.checkDispatch" => Ok(json!(team::check_from_json(params))),
+        // {from?} → 交给子智能体的补充消息前面的说明
+        "team.messageNote" => Ok(json!(team::message_note(params.get("from").and_then(Value::as_str)))),
+        // {kind, name, id, text} → 汇报 / 完成 / 失败 / 被停 / 工作流结束交给父级的文字
+        "team.noticeText" => Ok(json!(team::notice_text(
+            &string(params, "kind")?,
+            &string(params, "name")?,
+            &string(params, "id")?,
+            &string(params, "text")?
+        ))),
+        // {chain: [{giver?, name, assignment}], me} → 「你在整个任务里的位置」或 null
+        "team.ancestryNote" => Ok(json!(team::ancestry_note(&list(params, "chain")?, &string(params, "me")?))),
+        // {running: [{id, name}], waiting: [{id, name}]} → 现在有哪些子智能体
+        "team.childrenSummary" => Ok(json!(team::children_summary(&list(params, "running")?, &list(params, "waiting")?))),
         // {stoppedBy?, message, partial?} → 被停掉 / 失败时卡片上、交给父级的说明
         "agents.endedText" => {
             let text = |key: &str| params.get(key).and_then(Value::as_str).map(str::to_string);
