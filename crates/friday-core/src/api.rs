@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::chat_models::Conversation;
 use crate::{
-    archive, chat_request, chat_stream, context, conversations, engine_loop, engines, events, file_changes, file_edit, file_search,
+    agents, archive, chat_request, chat_stream, context, conversations, engine_loop, engines, events, file_changes, file_edit, file_search,
     folding, gate, journal, line_diff, mcp_client, mcp_config, model_traits, prompt_history, prompt_store, prompts, quota, repetition,
     secret_guard, secret_store, shell_rules, swift_json, tool_aliases, tool_defs, tool_files,
 };
@@ -308,6 +308,79 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
             let path = string(params, "path")?;
             let loaded = conversations::load(std::path::Path::new(&path), &string_list(params, "teamTools")?);
             serde_json::to_value(loaded).map_err(|error| ApiError { code: "internal", message: error.to_string() })
+        }
+
+        // {args} → {task, name?, role?, engine?, work?, thinking?, agentType?} | {failure}（派子智能体的参数）
+        "agents.taskSpec" => Ok(match agents::task_spec(&object(params, "args")?) {
+            Ok(spec) => spec,
+            Err(failure) => json!({ "failure": failure }),
+        }),
+        // {text} → look / change / hard 或 null（说的活的种类，中文也认）
+        "agents.parseWork" => Ok(json!(agents::parse_work(&string(params, "text")?))),
+        // {text} → off / low / medium / high 或 null（深度思考，中文也认）
+        "agents.parseThinking" => Ok(json!(agents::parse_thinking(&string(params, "text")?))),
+        // {given?, definition?, role?, task, used} → 名字（给的 > 现成子智能体的 > 角色里的 > 任务第一句 > 通才；重名加编号）
+        "agents.name" => {
+            let text = |key: &str| params.get(key).and_then(Value::as_str).map(str::to_string);
+            let used: HashSet<String> = string_list(params, "used")?.into_iter().collect();
+            Ok(json!(agents::agent_name(
+                text("given").as_deref(),
+                text("definition").as_deref(),
+                text("role").as_deref(),
+                &string(params, "task")?,
+                &used
+            )))
+        }
+        // {definitionRole?, role?, override?} → 子智能体的角色
+        "agents.role" => {
+            let text = |key: &str| params.get(key).and_then(Value::as_str).map(str::to_string);
+            Ok(json!(agents::composed_role(text("definitionRole").as_deref(), text("role").as_deref(), override_id(params))))
+        }
+        // {args} → {goal, steps: [{key, spec, after, check, arguments}]} | {failure}（run_workflow 的计划）
+        "workflow.plan" => Ok(match agents::workflow_plan(&object(params, "args")?) {
+            Ok(plan) => plan,
+            Err(failure) => json!({ "failure": failure }),
+        }),
+        // {steps: [{key, name, after}], outcomes: [done|failed|skipped|null], started: [index], stopped} → {skip: [{index, reason}], launch, finished}
+        "workflow.advance" => {
+            let steps = list(params, "steps")?;
+            let field = |step: &Value, key: &str| step.get(key).and_then(Value::as_str).unwrap_or("").to_string();
+            let keys: Vec<String> = steps.iter().map(|step| field(step, "key")).collect();
+            let names: Vec<String> = steps.iter().map(|step| field(step, "name")).collect();
+            let after: Vec<Vec<String>> = steps
+                .iter()
+                .map(|step| {
+                    step.get("after")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .collect();
+            let given = list(params, "outcomes")?;
+            let mut outcomes: Vec<Option<agents::Outcome>> =
+                (0..steps.len()).map(|index| given.get(index).and_then(Value::as_str).and_then(agents::Outcome::parse)).collect();
+            let started: HashSet<usize> = list(params, "started")?.iter().filter_map(Value::as_u64).map(|index| index as usize).collect();
+            Ok(agents::workflow_advance(&keys, &names, &after, &mut outcomes, &started, flag(params, "stopped")))
+        }
+        // {id, steps: [{key, name, card, after}], override?} → 交给主智能体的「已启动」
+        "workflow.startedText" => Ok(json!(agents::workflow_started(&string(params, "id")?, &list(params, "steps")?, override_id(params)))),
+        // {goal, task, check, upstream: [{key, name, result}], override?} → 一步的任务
+        "workflow.stepTask" => Ok(json!(agents::workflow_step_task(
+            &string(params, "goal")?,
+            &string(params, "task")?,
+            &string(params, "check")?,
+            &list(params, "upstream")?,
+            override_id(params)
+        ))),
+        // {goal, steps: [{key, name, card, outcome, check, result}], override?} → 交回主智能体的验收材料
+        "workflow.report" => Ok(json!(agents::workflow_report(&string(params, "goal")?, &list(params, "steps")?, override_id(params)))),
+        // {done, total} → 工作流卡片定稿时的一句
+        "workflow.summary" => {
+            let count = |key: &str| params.get(key).and_then(Value::as_u64).unwrap_or(0) as usize;
+            Ok(json!(agents::workflow_summary(count("done"), count("total"))))
         }
 
         // {name?, version?} → {client}（MCP 客户端；clientInfo 默认 Friday / 1.0）。事件：mcpClient.stderr {client, text}、
