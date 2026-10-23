@@ -34,7 +34,7 @@
 | 2 | 会话数据模型（Conversation、ChatMessage、MessageBlock、ToolEvent……，JSON 和 Swift Codable 一致，认不出的字段原样保留）+ 读 conversations.json 时的规整（旧存档补父子链、上次中途退出的标成中断、按更新时间排） | `Models/ChatModels.swift`、`ConversationStore.swift` 的读入；`models/ChatModels.cpp`、`ConversationStore.cpp` 的 loadFromDisk | 完成（核心只把用到的字段定成类型，其余在 extra 里；本机 8 MB 真实存档往返一字不差：`cargo run --release --example check_archive <文件>`） |
 | 2 | 改文件的增删行数（LineDiff：Myers 按全文 / 按指纹算、改动视图；分行和行指纹两端各留一份，热路径，三边有对照测试） | `Models/LineDiff.swift`；`models/LineDiff.cpp` | 完成 |
 | 2 | 诊断日志（journal.json，整个存储，句柄，后台写盘）、引擎配置（engines.json 的读写格式） | `Agent/AgentJournal.swift`、`LLM/Engine/EngineStore.swift`；`agent/AgentJournal.cpp`、`llm/engine/EngineStore.cpp` | 完成 |
-| 4 | 其余存档（capabilities.json、jobs.json、mcp.json、工具和提供方的清单）：读写和各自的注册表搅在一起（迁移、原文原样保存），注册表要看两端的状态、MCP 要事件回调，跟着各自的模块在第 4 阶段搬 | `Capabilities/`、`MCP/`、`Agent/ScriptTools`；`capabilities/`、`mcp/`、`agent/ScriptTools` | |
+| 4 | 其余存档：capabilities.json（三组提供方分开存、disabledKinds 写空数组、旧版按能力整体关的交给两端迁移）、jobs.json（只留 50 个）、mcp.json、脚本工具（tool.json 的默认值、存新版本归档旧版、历史版本、运行摘要和产出文件）、脚本提供方的包（provider.json 的默认值和检查、读、存新版本、导入时定位并换文件） | `Capabilities/`、`MCP/`、`Agent/ScriptTools`；`capabilities/`、`mcp/`、`agent/ScriptTools` | 完成（`capabilities.*`、`scriptTools.*`、`providers.*`、`mcp.*`；每个条目按两端的类型再解一遍（能力定义、设置项），起进程跑脚本和沙盒、解 / 打 zip、移到废纸篓、注册表留在两端；provider.json 的报错统一成 Qt 那样具体的说法） |
 | 2 | 提示词引擎（解析、展开参数和引用、装到数据目录、按段三方合并、校验、改一段、恢复成自带的、临时换一套段） | `Prompts/Prompts.swift`；`util/Prompts.cpp` | 完成（两端导出的全部提示词和旧实现逐字一样：`FRIDAY_PROMPT_DUMP`） |
 | 2 | 提示词版本历史里两端都要的规则（git 设置、git log 解成版本、提交说明、自动回滚的判断、上次提交时用的段） | `Prompts/PromptStore.swift`；`models/PromptStore.cpp` | 完成 |
 | 4 | PromptStore 其余部分（每秒看文件、停一会儿再提交、跑 git、界面状态）；找 git 留在两端（Swift 由核心在 git 队列里请两端找，Qt 启动时同步找好交给核心） | `Prompts/PromptStore.swift`；`models/PromptStore.cpp` | 完成（Qt 原来用 QFileSystemWatcher，改成和 Swift 一样每秒看一次） |
@@ -49,7 +49,7 @@
 | 4 | 事件回调：核心推事件、请两端做事再等回话（`friday_core_set_event_handler`，ABI 2；见 ARCHITECTURE.md §2.3） | `Core/CoreEvents.swift`；`util/CoreBridge` | 完成 |
 | 4 | 会话存储：落盘（核心留一份存档，两端只交改过的会话和顺序，核心在后台拼整份写；空白不写、只剩草稿的写；序号防先后乱；落盘间隔按编码耗时）、fork 新会话的拼法；增删改、防抖计时、界面观察的数组、正在生成的那条、搜索留在两端 | `Models/ConversationStore.swift`；`models/ConversationStore.cpp` | 完成（`archive.*`、`conversations.fork`；以前每次落盘编码整份存档，现在只编码改过的几段，没改的照核心读入时留着的写，两端认不出的字段也不丢；fork 带上任务模式（Swift 原来没带，按 Qt）；Qt 的落盘间隔原来固定 3 秒，现在和 Swift 一样按耗时放大；搜索要 Unicode 的分解和大小写折叠表，两端系统自带，核心没有这类依赖，留在两端） |
 | 4 | 引擎的对话循环（历史、收尾、按会话折叠、本地大模型压历史、超长重发、统计、复读处理、截断续写、工具结果和截图、说了没做的提醒） | `LLM/Engine/OpenAIChatEngine.swift` 的 run；`llm/engine/OpenAIChatEngine.cpp` | 完成（`loop.*` 句柄，两端只照着执行：发 HTTP、跑工具、问本机上限；参数不是合法 JSON 的工具调用历史里记 "{}"（Qt 原来的做法）） |
-| 4 | 智能体循环（AgentRunner：一轮的调度、审批、恢复、看门狗）、子智能体、工作流、团队调度 | `Agent/AgentRunner.swift`、`SubAgentRunner.swift`、`Workflow.swift`、`AgentTeamControl.swift`；`agent/` | |
+| 4 | 智能体循环里两端共有的规则：审批（删除类、系统改动、按权限模式；Windows 上再认 PowerShell / cmd 的删除命令）、看门狗（期限、卡住、原地打转、被停时的说明和建议、做到一半的结果）、交付检查和写完没验证、任务状态、子智能体（参数、起名、角色、用哪个大脑、按活挑模型和思考档位、太长结果的截断）、工作流（计划校验、按依赖推进、交回的文字）、团队调度（原样重派 / 重复派 / 原样往下传的检查、汇报的写法、在整个任务里的位置）、运行记录 | `Agent/AgentRunner.swift`、`SubAgentRunner.swift`、`Workflow.swift`、`AgentTeamControl.swift`、`AgentLiveness`、`DeliveryCheck`、`TurnCheck`、`TaskState`、`ModelChooser`；`agent/` | 完成（`approval.*`、`agents.*`、`workflow.*`、`team.*`、`delivery.*`、`turnCheck.*`、`agentLog.*`、`taskState.*`、`models.pick` 等；一轮怎么排、跑子智能体、团队状态、界面上的卡片、自动恢复的重试循环、钩子、命令留在两端——它们是执行和状态，绑着两端的线程、观察对象和任务取消） |
 | 5 | 远程服务端（照 REMOTE.md） | Qt `remote/` | |
 
 **会话存储本身（ConversationStore：增删改、分叉、落盘的防抖）和智能体循环一起搬（第 4 阶段）**：流式生成时每个字都改一次正在写的消息，
