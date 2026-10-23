@@ -15,6 +15,7 @@ pub mod chooser;
 pub mod context;
 pub mod conversations;
 pub mod delivery;
+pub mod deploy;
 pub mod engine_loop;
 pub mod engines;
 pub mod events;

@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::chat_models::Conversation;
 use crate::{
-    agents, approval, archive, capability_store, chat_request, chat_stream, chooser, context, conversations, delivery, engine_loop,
+    agents, approval, archive, capability_store, chat_request, chat_stream, chooser, context, conversations, delivery, deploy, engine_loop,
     engines, events, file_changes, file_edit, file_search, folding, gate, journal, line_diff, liveness, mcp_client, mcp_config,
     model_traits, prompt_history, prompt_store, prompts, provider_store, quota, repetition, script_tools, secret_guard, secret_store,
     shell_rules, swift_json, task_state, team, tool_aliases, tool_defs, tool_files,
@@ -506,6 +506,60 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
                 Err(failure) => json!({ "failure": failure }),
             })
         }
+        // {output} → 远程「FRIDAY-DEPLOY …」那几行解出的报告（含 missingPackages、canInstallLibraries、libraryCommand）
+        "deploy.parseReport" => Ok(deploy::parse_report(&string(params, "output")?)),
+        // {system, machine} → 包的键（linux-x64…）或空
+        "deploy.platformKey" => Ok(json!(deploy::platform_key(&string(params, "system")?, &string(params, "machine")?))),
+        // {manifest, channel: stable|beta, key, server?} → 要装的包或 null（latest.json）
+        "deploy.fromManifest" => Ok(deploy::from_manifest(
+            params.get("manifest").unwrap_or(&Value::Null),
+            &string(params, "channel")?,
+            &string(params, "key")?,
+            flag(params, "server"),
+        )),
+        // {directory, key, server?, protocol} → 目录里的包或 null
+        "deploy.fromDirectory" => Ok(deploy::from_directory(
+            std::path::Path::new(&string(params, "directory")?),
+            &string(params, "key")?,
+            flag(params, "server"),
+            params.get("protocol").and_then(Value::as_i64).unwrap_or(0),
+        )),
+        // {a, b} → -1 / 0 / 1
+        "deploy.compareVersions" => Ok(json!(deploy::compare_versions(&string(params, "a")?, &string(params, "b")?))),
+        // {version} → 是不是正式的 X.Y.Z
+        "deploy.isReleaseVersion" => Ok(json!(deploy::is_release_version(&string(params, "version")?))),
+        // {server, package, client, clientIsDevelopment, localPackages} → 服务端该不该升级
+        "deploy.shouldUpgrade" => Ok(json!(deploy::should_upgrade(
+            &string(params, "server")?,
+            &string(params, "package")?,
+            &string(params, "client")?,
+            flag(params, "clientIsDevelopment"),
+            flag(params, "localPackages")
+        ))),
+        // {report} → {managesInstall, usesServerPackage}
+        "deploy.decide" => {
+            let report = params.get("report").cloned().unwrap_or(Value::Null);
+            Ok(json!({ "managesInstall": deploy::manages_install(&report), "usesServerPackage": deploy::uses_server_package(&report) }))
+        }
+        // {text} → {version, packageName}（能不能拼进远程命令）
+        "deploy.checkText" => {
+            let text = string(params, "text")?;
+            Ok(json!({ "version": deploy::is_version_text(&text), "packageName": deploy::is_package_name(&text) }))
+        }
+        // {failure} → 失败原因的说法
+        "deploy.describeFailure" => Ok(json!(deploy::describe_failure(&string(params, "failure")?))),
+        // {shell: posix|powershell} → 看远程装了什么的命令
+        "deploy.inspectCommand" => Ok(json!(deploy::inspect_command(&string(params, "shell")?))),
+        // {shell, version, upload, server?, keep?} → 装 / 换上的命令（版本号不对时为空）
+        "deploy.deployCommand" => Ok(json!(deploy::deploy_command(
+            &string(params, "shell")?,
+            &string(params, "version")?,
+            flag(params, "upload"),
+            flag(params, "server"),
+            params.get("keep").and_then(Value::as_str).unwrap_or("")
+        ))),
+        // {packages} → 用 apt-get 装系统库的命令（包名不对时为空）
+        "deploy.installLibrariesCommand" => Ok(json!(deploy::install_libraries_command(&string_list(params, "packages")?))),
         // {id} → 提供方 id 合不合法
         "providers.isValidID" => Ok(json!(provider_store::is_valid_id(&string(params, "id")?))),
         // {manifest} → 补默认值的清单 | {failure}（provider.json）
