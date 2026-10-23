@@ -4,13 +4,13 @@
 //! code：`unknownMethod`（没有这个方法）、`invalidParams`（参数不对）、`internal`（核心里出错，C 接口层兜住的 panic 也报这个）。
 //! 时间一律用 Unix 毫秒（`now` 不传 = 现在），时长一律用秒（浮点）。
 //!
-//! 方法按模块分组（`quota.*`、`tools.*`、`secrets.*`、`vault.*`、`fold.*`）。有状态的（`vault.*`）先 open 拿句柄，后面的方法带上它，每个方法的参数和结果写在下面各自的函数上。
+//! 方法按模块分组（`quota.*`、`tools.*`、`secrets.*`、`vault.*`、`fold.*`、`conversations.*`）。有状态的（`vault.*`）先 open 拿句柄，后面的方法带上它，每个方法的参数和结果写在下面各自的函数上。
 
 use serde_json::{Map, Value, json};
 
 use std::collections::{HashMap, HashSet};
 
-use crate::{folding, quota, secret_guard, secret_store, tool_aliases};
+use crate::{conversations, folding, quota, secret_guard, secret_store, tool_aliases};
 
 #[derive(Debug)]
 pub struct ApiError {
@@ -257,6 +257,27 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
         "vault.environment" => {
             let names = string_list(params, "names")?;
             vault(params, vault_id(params)?, |vault| json!(vault.environment(&names)))
+        }
+
+        // {path, teamTools} → [Conversation]（读 conversations.json 并规整：解不出的那段跳过、旧存档补父子链、
+        //   上次中途退出的标成中断、按更新时间从新到旧；teamTools：会跑子 Agent 的工具名，中断时说明不会再交回结果）
+        "conversations.load" => {
+            let path = string(params, "path")?;
+            let loaded = conversations::load(std::path::Path::new(&path), &string_list(params, "teamTools")?);
+            serde_json::to_value(loaded).map_err(|error| ApiError { code: "internal", message: error.to_string() })
+        }
+
+        // {conversations, teamTools} → [Conversation]（同 conversations.load，规整内存里的会话）
+        "conversations.normalize" => {
+            let loaded = conversations::normalize(list(params, "conversations")?, &string_list(params, "teamTools")?);
+            serde_json::to_value(loaded).map_err(|error| ApiError { code: "internal", message: error.to_string() })
+        }
+        // {blocks, teamTools} → [MessageBlock]（还在运行 / 等确认的调用标成中断，递归进子 Agent 记录）
+        "blocks.markInterrupted" => {
+            let mut blocks: Vec<crate::chat_models::MessageBlock> = serde_json::from_value(Value::Array(list(params, "blocks")?))
+                .map_err(|error| ApiError::invalid(format!("blocks 解不出来：{error}")))?;
+            crate::chat_models::mark_interrupted(&mut blocks, &string_list(params, "teamTools")?);
+            serde_json::to_value(blocks).map_err(|error| ApiError { code: "internal", message: error.to_string() })
         }
 
         // {} → 主会话折叠的预算（估算 token；子 Agent 会话是它的两倍）

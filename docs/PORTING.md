@@ -28,11 +28,16 @@
 | 1 | 上下文折叠、会话折叠（摘要、子 Agent 会话的折叠、估算 token；主会话标折叠、调试用的预算开关留在两端） | `Agent/ContextFolding.swift`、`LLM/Engine/SessionFolding.swift`；`agent/ContextFolding.cpp`、`llm/engine/SessionFolding.cpp` | 完成 |
 | 1 | 密钥库：存储、收进库、执行时换回明文（句柄；界面观察的名字和记录是快照，远程副本留在两端） | `Secrets/SecretStore.swift`；`secrets/SecretStore.cpp` | 完成 |
 | 1 | 等额度的文案和时间（等到什么时候、消息上那一行、时间和「还有多久」的写法；停下、换大脑、定时检查留在两端） | `Agent/QuotaWaiting.swift`；`agent/QuotaWaiting.cpp` | 完成 |
-| 2 | 数据模型和存档格式（会话、消息块、工具事件的 JSON 与两端完全一致） | `Models/`；`models/` | |
+| 2 | 会话数据模型（Conversation、ChatMessage、MessageBlock、ToolEvent……，JSON 和 Swift Codable 一致，认不出的字段原样保留）+ 读 conversations.json 时的规整（旧存档补父子链、上次中途退出的标成中断、按更新时间排） | `Models/ChatModels.swift`、`ConversationStore.swift` 的读入；`models/ChatModels.cpp`、`ConversationStore.cpp` 的 loadFromDisk | 完成（核心只把用到的字段定成类型，其余在 extra 里；本机 8 MB 真实存档往返一字不差：`cargo run --release --example check_archive <文件>`） |
+| 2 | 改文件的增删行数（LineDiff） | `Models/LineDiff.swift`；`models/LineDiff.cpp` | |
+| 2 | 日志（journal.json）、引擎配置（engines.json）等其余存档的格式 | 各自模块 | |
 | 2 | 提示词拼装、工具定义 | `Prompts/`、`Agent/ToolRegistry.swift`；`agent/` | |
 | 3 | 在线引擎：请求、流式解析、重试、限流排队 | `LLM/Engine/`；`llm/engine/` | |
 | 3 | 工具执行：文件、搜索、shell、MCP | `Agent/AgentTools*`、`MCP/`；`agent/`、`mcp/` | |
 | 4 | 智能体循环、子智能体、工作流（有状态：句柄 + 事件回调） | `Agent/AgentRunner.swift`、`SubAgentRunner.swift`；`agent/` | |
 | 5 | 远程服务端（照 REMOTE.md） | Qt `remote/` | |
+
+**会话存储本身（ConversationStore：增删改、分叉、落盘的防抖）和智能体循环一起搬（第 4 阶段）**：流式生成时每个字都改一次正在写的消息，
+存储先搬进核心的话每个字都要过一次 C 接口。第 2 阶段先把数据模型和读入规整搬过来，两端照旧在内存里改、自己落盘。
 
 界面、平台相关的部分（SwiftUI / QML、终端画面、浏览器、通话的音视频采集、系统托盘、自动更新换包）留在两端。

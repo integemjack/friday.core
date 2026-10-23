@@ -38,6 +38,9 @@ friday.core 把这部分收成一份 Rust，两边**静态链接**、进程内�
 
 时间一律用 Unix 毫秒（参数名 `now` 这类，不传 = 现在），时长一律用秒（浮点）。
 
+成功时的文本**总是**紧凑的 `{"result":…}`（只有这一个键、没有空白）：Swift 的 `CoreBridge.callJSON` 直接切出 result 的原始字节交给
+`JSONDecoder`（整段存档这种大的不经过 `Any`）。改 `api::envelope` 的写法要一起改它。
+
 ### 2.2 线程
 
 任意线程都能调。纯逻辑的方法没有状态；有状态的用句柄：密钥库（`vault.*`）`vault.open` 返回 id，后面的方法带上它，
@@ -53,7 +56,8 @@ friday.core 把这部分收成一份 Rust，两边**静态链接**、进程内�
   `core/target/apple/libfridaycore.a`；
 - `SWIFT_INCLUDE_PATHS` 加 `core/include`（module.modulemap 里 `link "fridaycore"`），`LIBRARY_SEARCH_PATHS` 加 `core/target/apple`；
 - Swift 里 `import FridayCore`，只在 `Core/CoreBridge.swift` 里直接调 C 函数，其余代码用 `CoreBridge.call(方法, 参数)`（字典进、`Any` 出），
-  或 `CoreBridge.call(方法, encoding: 参数, as: 类型)`（Codable 进出，`JSONValue` 这类用它）。
+  或 `CoreBridge.call(方法, encoding: 参数, as: 类型)`（Codable 进出，`JSONValue` 这类用它），
+  或 `CoreBridge.callJSON(方法, json:)`（原始 JSON 字节进出，自己带编码器：会话存档要按 `.iso8601` 编解码日期）。
 
 ### 3.2 Qt 版（CMake）
 
