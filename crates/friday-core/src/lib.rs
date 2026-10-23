@@ -7,6 +7,7 @@ pub mod api;
 pub mod chat_models;
 pub mod conversations;
 pub mod folding;
+pub mod line_diff;
 pub mod quota;
 pub mod secret_guard;
 pub mod secret_store;

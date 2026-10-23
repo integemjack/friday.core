@@ -4,13 +4,13 @@
 //! code：`unknownMethod`（没有这个方法）、`invalidParams`（参数不对）、`internal`（核心里出错，C 接口层兜住的 panic 也报这个）。
 //! 时间一律用 Unix 毫秒（`now` 不传 = 现在），时长一律用秒（浮点）。
 //!
-//! 方法按模块分组（`quota.*`、`tools.*`、`secrets.*`、`vault.*`、`fold.*`、`conversations.*`）。有状态的（`vault.*`）先 open 拿句柄，后面的方法带上它，每个方法的参数和结果写在下面各自的函数上。
+//! 方法按模块分组（`quota.*`、`tools.*`、`secrets.*`、`vault.*`、`fold.*`、`conversations.*`、`diff.*`）。有状态的（`vault.*`）先 open 拿句柄，后面的方法带上它，每个方法的参数和结果写在下面各自的函数上。
 
 use serde_json::{Map, Value, json};
 
 use std::collections::{HashMap, HashSet};
 
-use crate::{conversations, folding, quota, secret_guard, secret_store, tool_aliases};
+use crate::{conversations, folding, line_diff, quota, secret_guard, secret_store, tool_aliases};
 
 #[derive(Debug)]
 pub struct ApiError {
@@ -280,6 +280,32 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
             serde_json::to_value(blocks).map_err(|error| ApiError { code: "internal", message: error.to_string() })
         }
 
+        // {old, new} → {added, removed}（按全文算改了几行）
+        "diff.count" => {
+            let counts = line_diff::count_text(&string(params, "old")?, &string(params, "new")?);
+            Ok(json!({ "added": counts.added, "removed": counts.removed }))
+        }
+        // {a, b} → {added, removed}（两边是每行的指纹，16 位十六进制）
+        "diff.countHashes" => {
+            let counts = line_diff::count(&hashes(params, "a")?, &hashes(params, "b")?);
+            Ok(json!({ "added": counts.added, "removed": counts.removed }))
+        }
+        // {a, b} → ["same" | "removed" | "added"]（每一行的去向）
+        "diff.script" => Ok(Value::from(
+            line_diff::script(&hashes(params, "a")?, &hashes(params, "b")?).into_iter().map(line_diff::Op::name).collect::<Vec<_>>(),
+        )),
+        // {old, new} → [{op, oldLine, newLine, text}]（改动视图：两边逐行对出来）
+        "diff.lines" => Ok(Value::from(
+            line_diff::diff_lines(&string(params, "old")?, &string(params, "new")?)
+                .into_iter()
+                .map(|line| json!({ "op": line.op.name(), "oldLine": line.old_line, "newLine": line.new_line, "text": line.text }))
+                .collect::<Vec<_>>(),
+        )),
+        // {text} → [指纹]（16 位十六进制；两端各有一份同样的算法，对照用）
+        "diff.lineHashes" => {
+            Ok(Value::from(line_diff::line_hashes(&string(params, "text")?).into_iter().map(line_diff::hex).collect::<Vec<_>>()))
+        }
+
         // {} → 主会话折叠的预算（估算 token；子 Agent 会话是它的两倍）
         "fold.budget" => Ok(Value::from(folding::BUDGET)),
         // {text} → 较早的回复正文的摘要
@@ -352,6 +378,13 @@ fn with_snapshot(vault: &secret_store::Vault, mut result: Value) -> Value {
         result.extend(snapshot);
     }
     result
+}
+
+fn hashes(params: &Params, key: &str) -> Result<Vec<u64>, ApiError> {
+    string_list(params, key)?
+        .iter()
+        .map(|text| line_diff::parse_hex(text).ok_or_else(|| ApiError::invalid(format!("{key} 里要是 16 位十六进制的指纹：{text}"))))
+        .collect()
 }
 
 fn string_map(params: &Params, key: &str) -> Result<HashMap<String, String>, ApiError> {
@@ -515,6 +548,18 @@ mod tests {
         assert_eq!(parsed("vault.get", &json!({ "vault": id, "name": "API_KEY" }).to_string())["error"]["code"], json!("invalidParams"));
         assert_eq!(parsed("vault.get", r#"{"name":"API_KEY"}"#)["error"]["code"], json!("invalidParams"));
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn diff_methods() {
+        assert_eq!(parsed("diff.count", r#"{"old":"a\nb\n","new":"a\nc\n"}"#)["result"], json!({ "added": 1, "removed": 1 }));
+        let hashes = parsed("diff.lineHashes", r#"{"text":"a\nb"}"#)["result"].clone();
+        let params = json!({ "a": hashes, "b": [hashes[0].clone()] });
+        assert_eq!(parsed("diff.countHashes", &params.to_string())["result"], json!({ "added": 0, "removed": 1 }));
+        assert_eq!(parsed("diff.script", &params.to_string())["result"], json!(["same", "removed"]));
+        assert_eq!(parsed("diff.countHashes", r#"{"a":["xyz"],"b":[]}"#)["error"]["code"], json!("invalidParams"));
+        let lines = parsed("diff.lines", r#"{"old":"","new":"x\n"}"#);
+        assert_eq!(lines["result"], json!([{ "op": "added", "oldLine": 0, "newLine": 1, "text": "x" }]));
     }
 
     #[test]
