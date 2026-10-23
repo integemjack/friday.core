@@ -4,13 +4,13 @@
 //! code：`unknownMethod`（没有这个方法）、`invalidParams`（参数不对）、`internal`（核心里出错，C 接口层兜住的 panic 也报这个）。
 //! 时间一律用 Unix 毫秒（`now` 不传 = 现在），时长一律用秒（浮点）。
 //!
-//! 方法按模块分组（`quota.*`、`tools.*`、`secrets.*`），每个方法的参数和结果写在下面各自的函数上。
+//! 方法按模块分组（`quota.*`、`tools.*`、`secrets.*`、`fold.*`），每个方法的参数和结果写在下面各自的函数上。
 
 use serde_json::{Map, Value, json};
 
 use std::collections::{HashMap, HashSet};
 
-use crate::{quota, secret_guard, tool_aliases};
+use crate::{folding, quota, secret_guard, tool_aliases};
 
 #[derive(Debug)]
 pub struct ApiError {
@@ -151,6 +151,33 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
         // {name} → 密钥名合不合法
         "secrets.isValidName" => Ok(Value::from(secret_guard::is_valid_name(&string(params, "name")?))),
 
+        // {} → 主会话折叠的预算（估算 token；子 Agent 会话是它的两倍）
+        "fold.budget" => Ok(Value::from(folding::BUDGET)),
+        // {text} → 较早的回复正文的摘要
+        "fold.text" => Ok(Value::from(folding::text(&string(params, "text")?))),
+        // {arguments} → 较早的工具调用参数（对象）的摘要
+        "fold.arguments" => Ok(Value::Object(folding::arguments(&object(params, "arguments")?))),
+        // {json} → 较早的工具调用参数（JSON 文本）的摘要
+        "fold.argumentsJSON" => Ok(Value::from(folding::arguments_json(&string(params, "json")?))),
+        // {name, text, taskStateTool, wholeTools} → 较早的工具结果的摘要
+        "fold.toolResult" => Ok(Value::from(folding::tool_result(&string(params, "name")?, &string(params, "text")?, &special(params)?))),
+        // {entries} → 估算 token（entries 是在线接口写法的请求历史）
+        "fold.estimate" => Ok(Value::from(folding::estimated_tokens(&list(params, "entries")?))),
+        // {history, folded, budget, echoesReasoning, taskStateTool, wholeTools}
+        //   → {steps, folded, before, after, history?}（folded 变了才带 history）
+        "fold.session" => {
+            let mut history = list(params, "history")?;
+            let start = usize::try_from(int(params, "folded")?).map_err(|_| ApiError::invalid("folded 不能是负数"))?;
+            let mut folded = start;
+            let echoes = params.get("echoesReasoning").and_then(Value::as_bool).unwrap_or(false);
+            let applied = folding::apply(&mut history, &mut folded, int(params, "budget")?, echoes, &special(params)?);
+            let mut result = json!({ "steps": applied.steps, "folded": folded, "before": applied.before, "after": applied.after });
+            if folded != start {
+                result["history"] = Value::Array(history);
+            }
+            Ok(result)
+        }
+
         _ => Err(ApiError { code: "unknownMethod", message: format!("没有这个方法：{method}") }),
     }
 }
@@ -161,6 +188,26 @@ fn string(params: &Params, key: &str) -> Result<String, ApiError> {
         Some(Value::String(text)) => Ok(text.clone()),
         Some(_) => Err(ApiError::invalid(format!("{key} 要是字符串"))),
     }
+}
+
+fn object(params: &Params, key: &str) -> Result<Map<String, Value>, ApiError> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(Map::new()),
+        Some(Value::Object(object)) => Ok(object.clone()),
+        Some(_) => Err(ApiError::invalid(format!("{key} 要是对象"))),
+    }
+}
+
+fn list(params: &Params, key: &str) -> Result<Vec<Value>, ApiError> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => Ok(items.clone()),
+        Some(_) => Err(ApiError::invalid(format!("{key} 要是数组"))),
+    }
+}
+
+fn special(params: &Params) -> Result<folding::Special, ApiError> {
+    Ok(folding::Special { task_state: string(params, "taskStateTool")?, whole: string_list(params, "wholeTools")? })
 }
 
 fn string_map(params: &Params, key: &str) -> Result<HashMap<String, String>, ApiError> {
@@ -255,6 +302,27 @@ mod tests {
         assert_eq!(parsed("secrets.isValidName", r#"{"name":"API_KEY"}"#)["result"], json!(true));
         assert_eq!(parsed("secrets.hash", r#"{"value":"abc"}"#)["result"].as_str().map(str::len), Some(64));
         assert_eq!(parsed("secrets.update", r#"{"values":{"A":1}}"#)["error"]["code"], json!("invalidParams"));
+    }
+
+    #[test]
+    fn fold_methods() {
+        assert_eq!(parsed("fold.budget", "")["result"], json!(48_000));
+        let special = json!({ "taskStateTool": "update_task_state", "wholeTools": ["delegate_task"] });
+        let mut params = special.clone();
+        params["name"] = json!("update_task_state");
+        params["text"] = json!("x");
+        assert_eq!(parsed("fold.toolResult", &params.to_string())["result"], json!("（已记下任务状态）"));
+        assert_eq!(parsed("fold.estimate", r#"{"entries":[{"content":"aaaaaaa"}]}"#)["result"], json!(2));
+        // 没超预算：不带 history
+        let mut params = special.clone();
+        params["history"] = json!([{ "role": "user", "content": "hi" }]);
+        params["folded"] = json!(0);
+        params["budget"] = json!(10);
+        let result = parsed("fold.session", &params.to_string());
+        assert_eq!(result["result"]["steps"], json!(0));
+        assert!(result["result"].get("history").is_none());
+        params["folded"] = json!(-1);
+        assert_eq!(parsed("fold.session", &params.to_string())["error"]["code"], json!("invalidParams"));
     }
 
     #[test]
