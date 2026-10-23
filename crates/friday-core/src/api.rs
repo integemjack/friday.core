@@ -4,11 +4,11 @@
 //! code：`unknownMethod`（没有这个方法）、`invalidParams`（参数不对）、`internal`（核心里出错，C 接口层兜住的 panic 也报这个）。
 //! 时间一律用 Unix 毫秒（`now` 不传 = 现在），时长一律用秒（浮点）。
 //!
-//! 方法按模块分组（`quota.*`），每个方法的参数和结果写在下面各自的函数上。
+//! 方法按模块分组（`quota.*`、`tools.*`），每个方法的参数和结果写在下面各自的函数上。
 
 use serde_json::{Map, Value, json};
 
-use crate::quota;
+use crate::{quota, tool_aliases};
 
 #[derive(Debug)]
 pub struct ApiError {
@@ -88,6 +88,19 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
             Ok(Value::from(quota::probe_delay(kind, int(params, "attempt")?)))
         }
 
+        // {name} → 内置工具名（name 是别家的叫法时），否则原样
+        "tools.canonicalName" => Ok(Value::from(tool_aliases::canonical_name(&string(params, "name")?))),
+        // {name, arguments} → 换过参数名的 arguments | null（没有要换的；name 是已经按注册表换好的工具名）
+        "tools.canonicalArguments" => {
+            let arguments = match params.get("arguments") {
+                None | Some(Value::Null) => Map::new(),
+                Some(Value::Object(arguments)) => arguments.clone(),
+                Some(_) => return Err(ApiError::invalid("arguments 要是对象")),
+            };
+            let canonical = tool_aliases::canonical_arguments(&string(params, "name")?, &arguments);
+            Ok(if canonical == arguments { Value::Null } else { Value::Object(canonical) })
+        }
+
         _ => Err(ApiError { code: "unknownMethod", message: format!("没有这个方法：{method}") }),
     }
 }
@@ -155,5 +168,14 @@ mod tests {
         assert_eq!(parsed("quota.probeDelay", r#"{"kind":"usage","attempt":2}"#)["result"], json!(1200.0));
         assert_eq!(parsed("quota.probeDelay", r#"{"kind":"x","attempt":2}"#)["error"]["code"], json!("invalidParams"));
         assert_eq!(parsed("quota.headerNames", "")["result"][0], json!("Retry-After"));
+    }
+
+    #[test]
+    fn tools_methods() {
+        assert_eq!(parsed("tools.canonicalName", r#"{"name":"Grep"}"#)["result"], json!("search_files"));
+        let changed = parsed("tools.canonicalArguments", r#"{"name":"read_file","arguments":{"file":"a"}}"#);
+        assert_eq!(changed["result"], json!({"path": "a"}));
+        assert_eq!(parsed("tools.canonicalArguments", r#"{"name":"read_file","arguments":{"path":"a"}}"#)["result"], Value::Null);
+        assert_eq!(parsed("tools.canonicalArguments", r#"{"name":"x","arguments":[]}"#)["error"]["code"], json!("invalidParams"));
     }
 }

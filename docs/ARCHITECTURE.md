@@ -51,7 +51,8 @@ friday.core 把这部分收成一份 Rust，两边**静态链接**、进程内�
 - 构建阶段「Rust 核心」调 `Friday/Tools/CI/build_rust_core.sh` → `core/scripts/build_apple.sh`，按 `ARCHS` 每个架构编一份、`lipo` 合成
   `core/target/apple/libfridaycore.a`；
 - `SWIFT_INCLUDE_PATHS` 加 `core/include`（module.modulemap 里 `link "fridaycore"`），`LIBRARY_SEARCH_PATHS` 加 `core/target/apple`；
-- Swift 里 `import FridayCore`，只在 `Core/CoreBridge.swift` 里直接调 C 函数，其余代码用 `CoreBridge.call(方法, 参数)`。
+- Swift 里 `import FridayCore`，只在 `Core/CoreBridge.swift` 里直接调 C 函数，其余代码用 `CoreBridge.call(方法, 参数)`（字典进、`Any` 出），
+  或 `CoreBridge.call(方法, encoding: 参数, as: 类型)`（Codable 进出，`JSONValue` 这类用它）。
 
 ### 3.2 Qt 版（CMake）
 

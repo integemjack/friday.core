@@ -9,6 +9,8 @@
 3. **两端的签名不动**，只换实现（见 ARCHITECTURE.md §3.3）。
 4. **规则的测试跟着搬到 Rust**；两端原来的测试保留，检查包装层。
 5. 每块单独提交（friday.core 一个提交，Friday 一个提交带子模块指针）。
+6. 要用两端状态的判断（比如「注册表里有没有这个工具」）留在包装层，核心只收结果；不要为此给核心加回调。
+7. Swift 传 `JSONValue` 这类 Codable 值用 `CoreBridge.call(_:encoding:as:)`，不经过 `Any`（整数和小数不会混）。
 
 ## 顺序
 
@@ -16,7 +18,7 @@
 |---|---|---|---|
 | 0 | 仓库、C 接口、两端静态链接、CoreBridge | — | 完成 |
 | 1 | 额度与限流：报错分类、恢复时间、定时试的间隔 | Swift `LLM/Engine/QuotaPolicy.swift`；Qt `llm/engine/QuotaPolicy.cpp` | 完成 |
-| 1 | 工具名、参数名纠正（别家叫法换成 Friday 的） | `Agent/ToolAliases.swift`；`agent/ToolAliases.cpp` | |
+| 1 | 工具名、参数名纠正（别家叫法换成 Friday 的；「注册表里有没有」留在两端） | `Agent/ToolAliases.swift`；`agent/ToolAliases.cpp` | 完成 |
 | 1 | 密钥识别与替换 | `Secrets/SecretGuard.swift`；`secrets/SecretGuard.cpp` | |
 | 1 | 上下文折叠、会话折叠 | `Agent/ContextFolding.swift`、`LLM/Engine/SessionFolding.swift`；`agent/ContextFolding.cpp`、`llm/engine/SessionFolding.cpp` | |
 | 1 | 等额度的文案和时间 | `Agent/QuotaWaiting.swift`；`agent/QuotaWaiting.cpp` | |

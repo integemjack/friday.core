@@ -5,6 +5,7 @@
 
 pub mod api;
 pub mod quota;
+pub mod tool_aliases;
 
 /// 版本号（== Cargo.toml 的 workspace.package.version）
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
