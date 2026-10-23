@@ -8,7 +8,7 @@ friday.core 把这部分收成一份 Rust，两边**静态链接**、进程内�
 
 ## 2. C 接口
 
-整个接口只有四个函数（`include/FridayCore.h`）：
+整个接口只有四个函数（`include/friday_core.h`）：
 
 | 函数 | 作用 |
 |---|---|

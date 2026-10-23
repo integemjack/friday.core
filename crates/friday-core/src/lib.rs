@@ -1,5 +1,5 @@
 //! Friday 的核心程序。Swift 版（macOS）和 Qt 版（Windows / Linux）都把它静态链进去，经 C 接口
-//! （`friday-core-ffi`，头文件 `include/FridayCore.h`）调用：方法名 + JSON 参数进，JSON 结果出（见 [`api`]）。
+//! （`friday-core-ffi`，头文件 `include/friday_core.h`）调用：方法名 + JSON 参数进，JSON 结果出（见 [`api`]）。
 //!
 //! 从两端各写一份的逻辑一块一块搬过来（docs/PORTING.md）；搬过来的一块，两端原来的实现就只剩调用这里的薄包装。
 

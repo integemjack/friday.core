@@ -1,6 +1,6 @@
 [package]
 name = "friday-core-ffi"
-description = "friday-core 的 C 接口（include/FridayCore.h），编成静态库 libfridaycore.a / fridaycore.lib"
+description = "friday-core 的 C 接口（include/friday_core.h），编成静态库 libfridaycore.a / fridaycore.lib"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true

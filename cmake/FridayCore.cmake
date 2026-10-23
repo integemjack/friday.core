@@ -4,7 +4,7 @@
 #   target_link_libraries(<目标> PUBLIC FridayCore::core)
 #
 # 构建时调 cargo 编 friday-core-ffi（一律 release；Rust 的源码改了才重编），产物在 <构建目录>/friday-core-target；
-# 头文件 include/FridayCore.h 跟着目标走。按 CMake 的目标平台选 Rust 的 target（Windows MSVC / Linux / macOS，x64 / arm64），
+# 头文件 include/friday_core.h 跟着目标走。按 CMake 的目标平台选 Rust 的 target（Windows MSVC / Linux / macOS，x64 / arm64），
 # 没装的 target 用 rustup 补上。
 # 变量：
 #   FRIDAY_CORE_CARGO     cargo 的路径（默认 PATH 里的，或 ~/.cargo/bin 里的）
