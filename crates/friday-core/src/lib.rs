@@ -20,6 +20,7 @@ pub mod folding;
 pub mod gate;
 pub mod journal;
 pub mod line_diff;
+pub mod mcp_client;
 pub mod mcp_config;
 pub mod model_traits;
 pub mod prompt_history;

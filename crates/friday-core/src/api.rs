@@ -4,7 +4,7 @@
 //! code：`unknownMethod`（没有这个方法）、`invalidParams`（参数不对）、`internal`（核心里出错，C 接口层兜住的 panic 也报这个）。
 //! 时间一律用 Unix 毫秒（`now` 不传 = 现在），时长一律用秒（浮点）。
 //!
-//! 方法按模块分组（`quota.*`、`tools.*`、`secrets.*`、`vault.*`、`fold.*`、`conversations.*`、`diff.*`、`archive.*`、`journal.*`、`engines.*`、`prompts.*`、`promptHistory.*`、`models.*`、`stream.*`、`repetition.*`、`chat.*`、`gate.*`、`context.*`、`edit.*`、`files.*`、`changes.*`、`shell.*`、`tools.*`）。有状态的（`vault.*`、`journal.*`、`stream.*`）先 open 拿句柄，后面的方法带上它，每个方法的参数和结果写在下面各自的函数上。
+//! 方法按模块分组（`quota.*`、`tools.*`、`secrets.*`、`vault.*`、`fold.*`、`conversations.*`、`diff.*`、`archive.*`、`mcpClient.*`、`journal.*`、`engines.*`、`prompts.*`、`promptHistory.*`、`models.*`、`stream.*`、`repetition.*`、`chat.*`、`gate.*`、`context.*`、`edit.*`、`files.*`、`changes.*`、`shell.*`、`tools.*`）。有状态的（`vault.*`、`journal.*`、`stream.*`）先 open 拿句柄，后面的方法带上它，每个方法的参数和结果写在下面各自的函数上。
 
 use serde_json::{Map, Value, json};
 
@@ -13,8 +13,8 @@ use std::collections::{HashMap, HashSet};
 use crate::chat_models::Conversation;
 use crate::{
     archive, chat_request, chat_stream, context, conversations, engine_loop, engines, events, file_changes, file_edit, file_search,
-    folding, gate, journal, line_diff, mcp_config, model_traits, prompt_history, prompt_store, prompts, quota, repetition, secret_guard,
-    secret_store, shell_rules, swift_json, tool_aliases, tool_defs, tool_files,
+    folding, gate, journal, line_diff, mcp_client, mcp_config, model_traits, prompt_history, prompt_store, prompts, quota, repetition,
+    secret_guard, secret_store, shell_rules, swift_json, tool_aliases, tool_defs, tool_files,
 };
 
 #[derive(Debug)]
@@ -308,6 +308,120 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
             let path = string(params, "path")?;
             let loaded = conversations::load(std::path::Path::new(&path), &string_list(params, "teamTools")?);
             serde_json::to_value(loaded).map_err(|error| ApiError { code: "internal", message: error.to_string() })
+        }
+
+        // {name?, version?} → {client}（MCP 客户端；clientInfo 默认 Friday / 1.0）。事件：mcpClient.stderr {client, text}、
+        //   mcpClient.exited {client, reason}（进程自己退出）、mcpClient.httpPost {client, post, url, headers: [[名, 值]], body}、
+        //   mcpClient.httpAbort {client, post}。下面阻塞的方法结果：成功的内容，或 {failure, cancelled?}
+        "mcpClient.open" => {
+            let name = params.get("name").and_then(Value::as_str).unwrap_or("Friday");
+            let version = params.get("version").and_then(Value::as_str).unwrap_or("1.0");
+            Ok(json!({ "client": mcp_client::open(name, version) }))
+        }
+        // {client} → null（断开并丢掉句柄）
+        "mcpClient.close" => {
+            mcp_client::close(handle(params, "client")?);
+            Ok(Value::Null)
+        }
+        // {client, program, arguments, environment, workingDirectory?, timeoutMs, call?} → {ok} | {failure}（起 stdio server 并握手）
+        "mcpClient.connectStdio" => {
+            let client = mcp_client_of(params)?;
+            let environment = string_map(params, "environment")?;
+            let directory = params.get("workingDirectory").and_then(Value::as_str).unwrap_or("").to_string();
+            let outcome = client.connect_stdio(
+                &string(params, "program")?,
+                &string_list(params, "arguments")?,
+                &environment,
+                &directory,
+                timeout_ms(params),
+                call_id(params),
+            );
+            Ok(mcp_outcome(outcome.map(|_| json!({ "ok": true }))))
+        }
+        // {client, url, headers: {名: 值}, timeoutMs, call?} → {ok} | {failure}（连 Streamable HTTP server 并握手）
+        "mcpClient.connectHttp" => {
+            let client = mcp_client_of(params)?;
+            let mut headers: Vec<(String, String)> = string_map(params, "headers")?.into_iter().collect();
+            headers.sort();
+            let outcome = client.connect_http(&string(params, "url")?, headers, timeout_ms(params), call_id(params));
+            Ok(mcp_outcome(outcome.map(|_| json!({ "ok": true }))))
+        }
+        // {client, cursor?, timeoutMs, call?} → {tools: [{name, title?, description?, inputSchema, annotationsTitle?, readOnlyHint?}], nextCursor?}
+        "mcpClient.listTools" => {
+            let client = mcp_client_of(params)?;
+            let cursor = params.get("cursor").and_then(Value::as_str).map(str::to_string);
+            Ok(mcp_outcome(client.list_tools(cursor.as_deref(), timeout_ms(params), call_id(params))))
+        }
+        // {client, name, arguments, timeoutMs, call?} → {content: [{kind, text? | data + mimeType? | uri, name?, resourceText?}], isError?}
+        "mcpClient.callTool" => {
+            let client = mcp_client_of(params)?;
+            let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            Ok(mcp_outcome(client.call_tool(&string(params, "name")?, arguments, timeout_ms(params), call_id(params))))
+        }
+        // {client, call} → null（这次调用马上以「已取消」结束）
+        "mcpClient.cancel" => {
+            if let Some(client) = mcp_client::get(handle(params, "client")?) {
+                client.cancel(handle(params, "call")?);
+            }
+            Ok(Value::Null)
+        }
+        // {client} → null（断开、结束进程，句柄留着）
+        "mcpClient.disconnect" => {
+            if let Some(client) = mcp_client::get(handle(params, "client")?) {
+                client.disconnect();
+            }
+            Ok(Value::Null)
+        }
+        // {client} → {connected, processRunning, pid?}
+        "mcpClient.status" => {
+            let client = mcp_client_of(params)?;
+            let mut status = json!({ "connected": client.is_connected(), "processRunning": client.process_running() });
+            if let Some(pid) = client.pid() {
+                status["pid"] = json!(pid);
+            }
+            Ok(status)
+        }
+        // 两端发 HTTP：{client, post, status, contentType, sessionId} → null（响应头）
+        "mcpClient.httpHead" => {
+            if let Some(client) = mcp_client::get(handle(params, "client")?) {
+                let status = params.get("status").and_then(Value::as_i64).unwrap_or(0);
+                let content_type = params.get("contentType").and_then(Value::as_str).unwrap_or("");
+                let session = params.get("sessionId").and_then(Value::as_str).unwrap_or("");
+                client.http_head(handle(params, "post")?, status, content_type, session);
+            }
+            Ok(Value::Null)
+        }
+        // {client, post, data（base64）} → null（一块响应体）
+        "mcpClient.httpData" => {
+            if let Some(client) = mcp_client::get(handle(params, "client")?) {
+                let data = mcp_client::decode_base64(&string(params, "data")?).ok_or_else(|| ApiError::invalid("data 不是 base64"))?;
+                client.http_data(handle(params, "post")?, &data);
+            }
+            Ok(Value::Null)
+        }
+        // {client, post, error?, aborted?} → null（结束：error 是网络层错误；aborted 是 httpAbort 之后断开的）
+        "mcpClient.httpEnd" => {
+            if let Some(client) = mcp_client::get(handle(params, "client")?) {
+                let error = params.get("error").and_then(Value::as_str).filter(|error| !error.is_empty());
+                client.http_end(handle(params, "post")?, error, flag(params, "aborted"));
+            }
+            Ok(Value::Null)
+        }
+        // {tool} → 宽松解出的工具（同 mcpClient.listTools 里的）
+        "mcp.normalizeTool" => Ok(mcp_client::normalize_tool(&Value::Object(object(params, "tool")?))),
+        // {content} → 解出的一段内容，解不出来是 {failure}（同 mcpClient.callTool 里的严格解码）
+        "mcp.decodeContent" => Ok(mcp_client::decode_one(params.get("content").unwrap_or(&Value::Null))
+            .unwrap_or_else(|| json!({ "failure": mcp_client::TYPE_MISMATCH }))),
+        // {current: [{name, config}], next: {名字: config}, force?} → {detach, keep, connect, disabled}（配置变了哪些要重连）
+        "mcp.syncPlan" => {
+            let current: Vec<(String, Value)> = list(params, "current")?
+                .into_iter()
+                .map(|item| {
+                    (item.get("name").and_then(Value::as_str).unwrap_or("").to_string(), item.get("config").cloned().unwrap_or(Value::Null))
+                })
+                .collect();
+            let force = if params.contains_key("force") { string_list(params, "force")? } else { Vec::new() };
+            Ok(mcp_client::sync_plan(&current, &object(params, "next")?, &force))
         }
 
         // {path, teamTools} → {archive, conversations}（同 conversations.load，核心留一份存档，之后落盘只交改过的会话；
@@ -1239,6 +1353,27 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
         }
 
         _ => Err(ApiError { code: "unknownMethod", message: format!("没有这个方法：{method}") }),
+    }
+}
+
+fn mcp_client_of(params: &Params) -> Result<std::sync::Arc<mcp_client::Client>, ApiError> {
+    let id = handle(params, "client")?;
+    mcp_client::get(id).ok_or_else(|| ApiError::invalid(format!("没有这个 MCP 客户端：{id}")))
+}
+
+fn timeout_ms(params: &Params) -> u64 {
+    params.get("timeoutMs").and_then(Value::as_u64).unwrap_or(30_000)
+}
+
+fn call_id(params: &Params) -> Option<u64> {
+    params.get("call").and_then(Value::as_u64)
+}
+
+fn mcp_outcome(outcome: Result<Value, mcp_client::Failure>) -> Value {
+    match outcome {
+        Ok(value) => value,
+        Err(failure) if failure.cancelled => json!({ "failure": failure.message, "cancelled": true }),
+        Err(failure) => json!({ "failure": failure.message }),
     }
 }
 
