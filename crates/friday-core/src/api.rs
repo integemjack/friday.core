@@ -14,7 +14,7 @@ use crate::chat_models::Conversation;
 use crate::{
     agents, archive, chat_request, chat_stream, context, conversations, delivery, engine_loop, engines, events, file_changes, file_edit,
     file_search, folding, gate, journal, line_diff, liveness, mcp_client, mcp_config, model_traits, prompt_history, prompt_store, prompts,
-    quota, repetition, secret_guard, secret_store, shell_rules, swift_json, tool_aliases, tool_defs, tool_files,
+    quota, repetition, secret_guard, secret_store, shell_rules, swift_json, task_state, tool_aliases, tool_defs, tool_files,
 };
 
 #[derive(Debug)]
@@ -394,6 +394,61 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
             let event: crate::chat_models::ToolEvent = serde_json::from_value(Value::Object(object(params, "event")?))
                 .map_err(|error| ApiError::invalid(format!("event 解不出来：{error}")))?;
             Ok(json!(delivery::log_text(&event)))
+        }
+        // {state?, args} → 应用一次 update_task_state 之后的状态（state：{goal, constraints, decisions, steps: [{text, status}], facts}）
+        "taskState.apply" => {
+            let mut state = task_state_of(params)?;
+            state.apply(&object(params, "args")?);
+            to_value(state)
+        }
+        // {calls: [参数的 JSON 文本]} → 依次重放后的状态
+        "taskState.replay" => to_value(task_state::replay(&string_list(params, "calls")?)),
+        // {state} → 展示给模型的样子
+        "taskState.render" => Ok(json!(task_state_of(params)?.rendered())),
+        // {old, new} → 两份之间改了什么（行）
+        "taskState.delta" => Ok(json!(task_state::delta_lines(&string(params, "old")?, &string(params, "new")?))),
+        // {note, previous?} → 附在用户消息后面交给模型的样子或 null
+        "taskState.renderedNote" => {
+            let previous = params.get("previous").and_then(Value::as_str).map(str::to_string);
+            Ok(json!(task_state::rendered_note(&string(params, "note")?, previous.as_deref())))
+        }
+        // {events: [{note?, folded} | {call, shown}]} → {notes: [每条 note 交给模型的样子或 null], text?}（模型在没折叠的部分里看到的）
+        "taskState.visible" => {
+            let events: Vec<task_state::Event> = list(params, "events")?
+                .iter()
+                .map(|event| match event.get("call").and_then(Value::as_str) {
+                    Some(call) => task_state::Event::Call {
+                        arguments: call.to_string(),
+                        shown: event.get("shown").and_then(Value::as_bool).unwrap_or(true),
+                    },
+                    None => task_state::Event::Note {
+                        note: event.get("note").and_then(Value::as_str).map(str::to_string),
+                        folded: event.get("folded").and_then(Value::as_bool).unwrap_or(false),
+                    },
+                })
+                .collect();
+            let (notes, text) = task_state::visible(&events);
+            Ok(json!({ "notes": notes, "text": text }))
+        }
+        // {text?, state, args, shown} → {text, state, before}（沿路重放一次 update_task_state：模型看到的整份、重放到的状态、改之前的状态）
+        "taskState.visibleApply" => {
+            let mut text = params.get("text").and_then(Value::as_str).map(str::to_string);
+            let mut state = task_state_of(params)?;
+            let before = task_state::visible_apply(&mut text, &mut state, &object(params, "args")?, flag(params, "shown"));
+            Ok(json!({ "text": text, "state": to_value(state)?, "before": to_value(before)? }))
+        }
+        // {state, messages: [{text, fromAgent?, interjected?, files?}]} → 附在用户消息后面的那段或 null
+        "taskState.promptNote" => Ok(json!(task_state::prompt_note(&task_state_of(params)?, &user_messages(params)?))),
+        // {state, messages} → 附在子智能体任务后面的主任务背景或 null
+        "taskState.subAgentNote" => Ok(json!(task_state::sub_agent_note(&task_state_of(params)?, &user_messages(params)?))),
+        // {messages} → 像是在提要求的用户消息（最近 3 条，每条最多 300 字）
+        "taskState.requirements" => Ok(json!(task_state::requirement_messages(&user_messages(params)?))),
+        // {messages} → 子智能体背景里用户说过的话或 null
+        "taskState.userWords" => Ok(json!(task_state::user_words(&user_messages(params)?))),
+        // {text} → {requirement, rule}（像在提要求 / 关键信息里的规矩）
+        "taskState.classify" => {
+            let text = string(params, "text")?;
+            Ok(json!({ "requirement": task_state::looks_like_requirement(&text), "rule": task_state::looks_like_rule(&text) }))
         }
         // {stoppedBy?, message, partial?} → 被停掉 / 失败时卡片上、交给父级的说明
         "agents.endedText" => {
@@ -1565,6 +1620,32 @@ fn mcp_outcome(outcome: Result<Value, mcp_client::Failure>) -> Value {
 
 fn blocks_of(params: &Params) -> Result<Vec<crate::chat_models::MessageBlock>, ApiError> {
     serde_json::from_value(Value::Array(list(params, "blocks")?)).map_err(|error| ApiError::invalid(format!("blocks 解不出来：{error}")))
+}
+
+fn task_state_of(params: &Params) -> Result<task_state::TaskState, ApiError> {
+    match params.get("state") {
+        None | Some(Value::Null) => Ok(task_state::TaskState::default()),
+        Some(value) => serde_json::from_value(value.clone()).map_err(|error| ApiError::invalid(format!("state 解不出来：{error}"))),
+    }
+}
+
+fn user_messages(params: &Params) -> Result<Vec<task_state::UserMessage>, ApiError> {
+    Ok(list(params, "messages")?
+        .iter()
+        .map(|message| task_state::UserMessage {
+            text: message.get("text").and_then(Value::as_str).unwrap_or("").to_string(),
+            from_agent: message.get("fromAgent").and_then(Value::as_bool).unwrap_or(false),
+            interjected: message.get("interjected").and_then(Value::as_bool).unwrap_or(false),
+            files: message
+                .get("files")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect(),
+        })
+        .collect())
 }
 
 fn conversations_of(params: &Params, key: &str) -> Result<Vec<Conversation>, ApiError> {

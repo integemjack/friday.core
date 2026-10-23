@@ -681,7 +681,7 @@ fn clip(text: &str, limit: usize) -> String {
 
 /// 参数的可读 JSON 压成一行：按行切开（丢掉空行）、每行去掉首尾空格，用空格连起来
 fn compact(json: &str) -> String {
-    json.split(['\n', '\r']).filter(|line| !line.is_empty()).map(|line| line.trim_matches([' ', '\t'])).collect::<Vec<_>>().join(" ")
+    crate::task_state::split_lines(json).into_iter().map(|line| line.trim_matches([' ', '\t'])).collect::<Vec<_>>().join(" ")
 }
 
 /// 运行记录整理成给模型看的文字（不截断；read_agent_log 给了 offset 时按它分页读）

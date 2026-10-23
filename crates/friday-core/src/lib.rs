@@ -35,6 +35,7 @@ pub mod secret_guard;
 pub mod secret_store;
 pub mod shell_rules;
 pub mod swift_json;
+pub mod task_state;
 pub mod tool_aliases;
 pub mod tool_defs;
 pub mod tool_files;
