@@ -1,0 +1,5 @@
+# 本机和 CI 用同一个版本；升级时改这里（目标平台由 scripts/ 和 cmake/ 按需 rustup target add）
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+components = ["clippy", "rustfmt"]

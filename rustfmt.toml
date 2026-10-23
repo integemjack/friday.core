@@ -1,0 +1,3 @@
+# 和 Swift / Qt 两边的行宽一致
+max_width = 140
+use_small_heuristics = "Max"

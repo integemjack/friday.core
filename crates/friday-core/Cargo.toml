@@ -1,0 +1,15 @@
+[package]
+name = "friday-core"
+description = "Friday 的核心逻辑：Swift 版和 Qt 版共用，经 friday-core-ffi 的 C 接口调用"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "friday_core"
+
+[dependencies]
+chrono.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true

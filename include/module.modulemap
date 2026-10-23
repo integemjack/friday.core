@@ -1,0 +1,6 @@
+module FridayCore {
+    header "FridayCore.h"
+    link "fridaycore"
+    link framework "CoreFoundation"
+    export *
+}

@@ -1,0 +1,20 @@
+[workspace]
+resolver = "3"
+members = ["crates/friday-core", "crates/friday-core-ffi"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+friday-core = { path = "crates/friday-core" }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+# 崩溃报告要能对上行号；静态库链进 App 后由 App 的链接器去掉没用到的代码
+debug = "line-tables-only"
+codegen-units = 1

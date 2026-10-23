@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml 定版本，rustup 自动装
+      - name: 格式
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: 测试
+        run: cargo test --locked
+      - name: 静态库
+        run: cargo build --locked --release -p friday-core-ffi
