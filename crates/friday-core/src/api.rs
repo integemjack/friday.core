@@ -4,15 +4,15 @@
 //! code：`unknownMethod`（没有这个方法）、`invalidParams`（参数不对）、`internal`（核心里出错，C 接口层兜住的 panic 也报这个）。
 //! 时间一律用 Unix 毫秒（`now` 不传 = 现在），时长一律用秒（浮点）。
 //!
-//! 方法按模块分组（`quota.*`、`tools.*`、`secrets.*`、`vault.*`、`fold.*`、`conversations.*`、`diff.*`、`journal.*`、`engines.*`、`prompts.*`、`promptHistory.*`、`models.*`、`stream.*`、`repetition.*`、`chat.*`、`gate.*`、`context.*`）。有状态的（`vault.*`、`journal.*`、`stream.*`）先 open 拿句柄，后面的方法带上它，每个方法的参数和结果写在下面各自的函数上。
+//! 方法按模块分组（`quota.*`、`tools.*`、`secrets.*`、`vault.*`、`fold.*`、`conversations.*`、`diff.*`、`journal.*`、`engines.*`、`prompts.*`、`promptHistory.*`、`models.*`、`stream.*`、`repetition.*`、`chat.*`、`gate.*`、`context.*`、`edit.*`、`files.*`、`changes.*`、`shell.*`、`tools.*`）。有状态的（`vault.*`、`journal.*`、`stream.*`）先 open 拿句柄，后面的方法带上它，每个方法的参数和结果写在下面各自的函数上。
 
 use serde_json::{Map, Value, json};
 
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    chat_request, chat_stream, context, conversations, engines, folding, gate, journal, line_diff, model_traits, prompt_history, prompts,
-    quota, repetition, secret_guard, secret_store, tool_aliases,
+    chat_request, chat_stream, context, conversations, engines, file_changes, file_edit, file_search, folding, gate, journal, line_diff,
+    model_traits, prompt_history, prompts, quota, repetition, secret_guard, secret_store, shell_rules, tool_aliases, tool_defs, tool_files,
 };
 
 #[derive(Debug)]
@@ -516,6 +516,248 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
             Ok(Value::Null)
         }
 
+        // 内置文件工具（路径由两端解析好传进来）。结果 {output, lineDiff?: {added, removed}}；失败 {failure: {kind: invalid | failed, message}}
+        // {path, workingDirectory?}
+        "files.list" => tool_output(tool_files::list_directory(&string(params, "path")?, &string(params, "workingDirectory")?)),
+        // {path, offset?, limit?, workingDirectory?}（文字；图片、视频、音频两端先认出来交给界面）
+        "files.read" => tool_output(tool_files::read_file(
+            &string(params, "path")?,
+            optional_int(params, "offset"),
+            optional_int(params, "limit"),
+            &string(params, "workingDirectory")?,
+        )),
+        // {path, content}
+        "files.write" => tool_output(tool_files::write_file(&string(params, "path")?, &string(params, "content")?)),
+        // {path, workingDirectory?, edits?: [{old_text, new_text, replace_all?}] | oldText, newText, replaceAll?}（edits 给了就按几处改）
+        "files.edit" => {
+            let change = edit_change(params)?;
+            tool_output(tool_files::edit_file(&string(params, "path")?, &change, &string(params, "workingDirectory")?))
+        }
+        // {pattern, root, workingDirectory?}
+        "files.find" => text_output(file_search::find_files(
+            &string(params, "pattern")?,
+            &string(params, "root")?,
+            &string(params, "workingDirectory")?,
+        )),
+        // {pattern, root, glob?, ignoreCase?, workingDirectory?}
+        "files.search" => {
+            let glob = params.get("glob").and_then(Value::as_str);
+            text_output(file_search::search_files(
+                &string(params, "pattern")?,
+                &string(params, "root")?,
+                glob,
+                flag(params, "ignoreCase"),
+                &string(params, "workingDirectory")?,
+            ))
+        }
+        // {keywords, root, glob?, matchCase?, matchAny?, workingDirectory?}
+        "files.keywords" => {
+            let glob = params.get("glob").and_then(Value::as_str);
+            text_output(file_search::search_keywords(
+                &string(params, "keywords")?,
+                &string(params, "root")?,
+                glob,
+                flag(params, "matchCase"),
+                flag(params, "matchAny"),
+                &string(params, "workingDirectory")?,
+            ))
+        }
+        // {name} → 遍历时跳不跳过这个目录（隐藏的、依赖和构建目录）
+        "files.skipsDirectory" => Ok(Value::from(file_search::skips_directory(&string(params, "name")?))),
+        // {text, matchCase?} → [关键词]（双引号括起来的算一个词，去掉重复的）
+        "files.splitKeywords" => Ok(Value::from(file_search::split_keywords(&string(params, "text")?, flag(params, "matchCase")))),
+        // {text, offset?, limit?, maxCharacters?} → 按行读的结果
+        "files.readLines" => Ok(Value::from(file_search::read_lines(
+            &string(params, "text")?,
+            optional_int(params, "offset"),
+            optional_int(params, "limit"),
+            optional_int(params, "maxCharacters").map_or(tool_files::MAX_OUTPUT, |max| max.max(1) as usize),
+        ))),
+        // {path, workingDirectory?, wantDirectory} → 路径不对时的提示（以换行开头，没有为空）
+        "files.pathHint" => Ok(Value::from(tool_files::path_hint(
+            &string(params, "path")?,
+            &string(params, "workingDirectory")?,
+            flag(params, "wantDirectory"),
+        ))),
+        // {path} → 读失败的说明
+        "files.readFailure" => Ok(Value::from(tool_files::read_failure(&string(params, "path")?))),
+        // {path, workingDirectory?} → 给模型看的路径（在工作目录下写相对路径）
+        "files.displayPath" => Ok(Value::from(file_search::display_path(&string(params, "path")?, &string(params, "workingDirectory")?))),
+        // {glob, relativePath} → 通配对不对得上（写错了为 null）
+        "files.globMatches" => {
+            let (glob, relative) = (string(params, "glob")?, string(params, "relativePath")?);
+            Ok(file_search::glob_expression(&glob)
+                .map_or(Value::Null, |expression| Value::from(file_search::matches(&expression, &glob, &relative))))
+        }
+        // {text} → 太长的留头尾；{text, offset?} → 分页；{html} → 去掉标签的文字；{bytes} → 「12 KB」
+        "tools.truncate" => Ok(Value::from(tool_files::truncate(&string(params, "text")?))),
+        "tools.page" => Ok(Value::from(tool_files::page(&string(params, "text")?, optional_int(params, "offset")))),
+        "tools.stripHTML" => Ok(Value::from(tool_files::strip_html(&string(params, "html")?))),
+        "tools.byteCount" => Ok(Value::from(tool_files::byte_count(int(params, "bytes")?))),
+
+        // {text, oldText, newText, replaceAll?} → {text, count, firstLine, lastLine, inserted, replacedAt, removedLength, note, summary?}
+        //   | {failure: {kind: invalid, message}}（path 给了就带 summary）
+        "edit.apply" => {
+            match file_edit::apply(
+                &string(params, "text")?,
+                &string(params, "oldText")?,
+                &string(params, "newText")?,
+                flag(params, "replaceAll"),
+            ) {
+                Ok(edited) => {
+                    let path = string(params, "path")?;
+                    let summary = (!path.is_empty()).then(|| file_edit::summary(&path, &edited));
+                    Ok(json!({
+                        "text": edited.text, "count": edited.count, "firstLine": edited.first_line, "lastLine": edited.last_line,
+                        "inserted": edited.inserted, "replacedAt": edited.replaced_at, "removedLength": edited.removed_length,
+                        "note": edited.note, "summary": summary,
+                    }))
+                }
+                Err(message) => Ok(json!({ "failure": { "kind": "invalid", "message": message } })),
+            }
+        }
+        // {text, edits: [{old_text, new_text, replace_all?}], path?} → {text, count, inserted, starts, notes, summary?} | {failure}
+        "edit.applyAll" => {
+            let edits = edits(params)?.unwrap_or_default();
+            match file_edit::apply_all(&string(params, "text")?, &edits) {
+                Ok(result) => {
+                    let path = string(params, "path")?;
+                    let summary = (!path.is_empty()).then(|| file_edit::summary_all(&path, &result));
+                    Ok(json!({
+                        "text": result.text, "count": result.count, "inserted": result.inserted, "starts": result.starts,
+                        "notes": result.notes, "summary": summary,
+                    }))
+                }
+                Err(message) => Ok(json!({ "failure": { "kind": "invalid", "message": message } })),
+            }
+        }
+
+        // {path, text, count, firstLine, lastLine, note?} → 「已修改 <path>：替换了 N 处……」+ 改完的几行（edit.apply 的结果）
+        "edit.summary" => {
+            let edited = file_edit::Edited {
+                text: string(params, "text")?,
+                count: int(params, "count")?.max(0) as usize,
+                first_line: int(params, "firstLine")?.max(1) as usize,
+                last_line: int(params, "lastLine")?.max(1) as usize,
+                inserted: String::new(),
+                replaced_at: Vec::new(),
+                removed_length: 0,
+                note: string(params, "note")?,
+            };
+            Ok(Value::from(file_edit::summary(&string(params, "path")?, &edited)))
+        }
+        // {path, text, count, inserted, starts, notes?} → 「已修改 <path>：N 处修改都改好了……」（edit.applyAll 的结果）
+        "edit.summaryAll" => {
+            let starts = list(params, "starts")?.iter().map(|start| start.as_u64().unwrap_or(0) as usize).collect();
+            let result = file_edit::MultiEdited {
+                text: string(params, "text")?,
+                count: int(params, "count")?.max(0) as usize,
+                inserted: string_list(params, "inserted")?,
+                starts,
+                notes: string_list(params, "notes")?,
+            };
+            if result.starts.len() != result.inserted.len() {
+                return Err(ApiError::invalid("starts 和 inserted 要一样多"));
+            }
+            Ok(Value::from(file_edit::summary_all(&string(params, "path")?, &result)))
+        }
+
+        // 命令前后看改了哪些文件。{command, workingDirectory?, home?, currentDirectory?} → {changes}（执行前看一遍）
+        "changes.before" => {
+            let snapshot = file_changes::before(
+                &string(params, "command")?,
+                &string(params, "workingDirectory")?,
+                &string(params, "home")?,
+                &string(params, "currentDirectory")?,
+            );
+            Ok(json!({ "changes": file_changes::open(snapshot) }))
+        }
+        // {changes} → {lineDiff: {added, removed} | null, changed: [{path, kind: created | modified | deleted, before: [指纹] | null}]}
+        //   （执行后比一遍，句柄随之关掉；指纹是 16 位十六进制）
+        "changes.after" => {
+            let id = handle(params, "changes")?;
+            let snapshot = file_changes::take(id).ok_or_else(|| ApiError::invalid(format!("没有这个句柄：{id}（比过了？）")))?;
+            let (counts, changed) = file_changes::after(&snapshot);
+            let changed: Vec<Value> = changed
+                .into_iter()
+                .map(|change| {
+                    json!({
+                        "path": change.path,
+                        "kind": change.kind.name(),
+                        "before": change.before.map(|lines| lines.into_iter().map(line_diff::hex).collect::<Vec<_>>()),
+                    })
+                })
+                .collect();
+            Ok(json!({
+                "lineDiff": counts.map(|counts| json!({ "added": counts.added, "removed": counts.removed })),
+                "changed": changed,
+            }))
+        }
+        // {changes} → null（命令没跑成，不比了）
+        "changes.discard" => {
+            file_changes::take(handle(params, "changes")?);
+            Ok(Value::Null)
+        }
+        // {command, base, home?} → [命令里写到的路径]
+        "changes.mentionedPaths" => {
+            Ok(Value::from(file_changes::mentioned_paths(&string(params, "command")?, &string(params, "base")?, &string(params, "home")?)))
+        }
+        // {path, home?} → null（write_file / edit_file 刚写完：同一时间跑着的命令不把它算进去）
+        "changes.noteWritten" => {
+            file_changes::note_written(&string(params, "path")?, &string(params, "home")?);
+            Ok(Value::Null)
+        }
+
+        // run_shell 的规则。{timeoutSeconds?} → 秒（默认 60，限在 1–600）
+        "shell.timeout" => Ok(Value::from(shell_rules::timeout_seconds(optional_int(params, "timeoutSeconds")))),
+        // {command, processName, pid} → 拒绝的说明 | null（会结束 Friday 自己的命令）
+        "shell.selfKill" => {
+            Ok(shell_rules::self_kill_refusal(&string(params, "command")?, &string(params, "processName")?, int(params, "pid")?)
+                .map_or(Value::Null, Value::from))
+        }
+        // {command, conversation?} → 结果后面的提示（以换行开头，没有为空）
+        "shell.hint" => Ok(Value::from(shell_rules::hint(&string(params, "command")?, &string(params, "conversation")?))),
+        // {exitCode?, output} → 「退出码 N」+ 输出（exitCode 不给：超时或被终止）
+        "shell.result" => Ok(Value::from(shell_rules::result(optional_int(params, "exitCode"), &string(params, "output")?))),
+
+        // 工具定义。{args?, override?} → [{name, title, symbol, fallbackSymbol, permission, spec}]（内置工具）
+        "tools.builtins" => {
+            let args = string_map(params, "args")?;
+            Ok(Value::from(tool_defs::builtins(&args, override_id(params)).iter().map(tool_defs::Builtin::to_json).collect::<Vec<_>>()))
+        }
+        // {name, description?, parameters, args?, override?} → spec（说明有提示词的用提示词的）
+        "tools.spec" => {
+            let parameters = params.get("parameters").cloned().unwrap_or_else(|| json!({}));
+            Ok(tool_defs::make_spec(
+                &string(params, "name")?,
+                &string(params, "description")?,
+                &parameters,
+                &string_map(params, "args")?,
+                override_id(params),
+            ))
+        }
+        // {params: [{name, type, description?, required?}]} → 参数的 JSON Schema
+        "tools.schema" => {
+            let list = list(params, "params")?;
+            let fields: Vec<(String, String, String, bool)> = list
+                .iter()
+                .map(|item| {
+                    let text = |key: &str| item.get(key).and_then(Value::as_str).unwrap_or("").to_string();
+                    (text("name"), text("type"), text("description"), item.get("required").and_then(Value::as_bool).unwrap_or(false))
+                })
+                .collect();
+            let params: Vec<tool_defs::Param> = fields
+                .iter()
+                .map(|(name, kind, description, required)| tool_defs::Param { name, kind, description, required: *required })
+                .collect();
+            Ok(tool_defs::schema(&params))
+        }
+        // {spec, arguments} → [没给的必填参数]
+        "tools.missingRequired" => {
+            let spec = params.get("spec").cloned().unwrap_or(Value::Null);
+            Ok(Value::from(tool_defs::missing_required(&spec, &object(params, "arguments")?)))
+        }
+
         // {showReasoning, quota} → {stream}（一段请求一个；quota：流里的报错要不要按额度用完认）
         "stream.open" => {
             let flag = |key: &str| params.get(key).and_then(Value::as_bool).unwrap_or(false);
@@ -802,6 +1044,75 @@ fn retry_after(params: &Params) -> Option<f64> {
         Some(Value::String(text)) => chat_request::header_seconds(text),
         _ => None,
     }
+}
+
+fn flag(params: &Params, key: &str) -> bool {
+    params.get(key).and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// 可选的整数（整数值的小数也算）
+fn optional_int(params: &Params, key: &str) -> Option<i64> {
+    match params.get(key) {
+        Some(Value::Number(_)) => int(params, key).ok(),
+        _ => None,
+    }
+}
+
+fn tool_output(outcome: Result<tool_files::Output, tool_files::ToolError>) -> Result<Value, ApiError> {
+    Ok(match outcome {
+        Ok(output) => json!({
+            "output": output.text,
+            "lineDiff": output.line_diff.map(|counts| json!({ "added": counts.added, "removed": counts.removed })),
+        }),
+        Err(error) => failure(&error),
+    })
+}
+
+fn text_output(outcome: Result<String, tool_files::ToolError>) -> Result<Value, ApiError> {
+    Ok(match outcome {
+        Ok(text) => json!({ "output": text }),
+        Err(error) => failure(&error),
+    })
+}
+
+fn failure(error: &tool_files::ToolError) -> Value {
+    let kind = match error {
+        tool_files::ToolError::Invalid(_) => "invalid",
+        tool_files::ToolError::Failed(_) => "failed",
+    };
+    json!({ "failure": { "kind": kind, "message": error.message() } })
+}
+
+/// edits 数组：每项 {old_text, new_text, replace_all?}；不给为 None
+fn edits(params: &Params) -> Result<Option<Vec<file_edit::Edit>>, ApiError> {
+    let Some(items) = params.get("edits").and_then(Value::as_array) else { return Ok(None) };
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let text = |key: &str| item.get(key).and_then(Value::as_str).map(str::to_string);
+            match (text("old_text"), text("new_text")) {
+                (Some(old_text), Some(new_text)) => Ok(file_edit::Edit {
+                    old_text,
+                    new_text,
+                    replace_all: item.get("replace_all").and_then(Value::as_bool).unwrap_or(false),
+                }),
+                _ => Err(ApiError::invalid(format!("edits 的第 {} 项要是 {{old_text, new_text, replace_all?}}", index + 1))),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+fn edit_change(params: &Params) -> Result<tool_files::Change, ApiError> {
+    if let Some(edits) = edits(params)?.filter(|edits| !edits.is_empty()) {
+        return Ok(tool_files::Change::Several(edits));
+    }
+    Ok(tool_files::Change::One {
+        old_text: string(params, "oldText")?,
+        new_text: string(params, "newText")?,
+        replace_all: flag(params, "replaceAll"),
+    })
 }
 
 fn stream_of(params: &Params, body: impl FnOnce(&mut chat_stream::Parser) -> Value) -> Result<Value, ApiError> {

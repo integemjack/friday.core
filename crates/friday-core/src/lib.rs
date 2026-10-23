@@ -10,6 +10,9 @@ pub mod chat_stream;
 pub mod context;
 pub mod conversations;
 pub mod engines;
+pub mod file_changes;
+pub mod file_edit;
+pub mod file_search;
 pub mod folding;
 pub mod gate;
 pub mod journal;
@@ -21,8 +24,11 @@ pub mod quota;
 pub mod repetition;
 pub mod secret_guard;
 pub mod secret_store;
+pub mod shell_rules;
 pub mod swift_json;
 pub mod tool_aliases;
+pub mod tool_defs;
+pub mod tool_files;
 pub mod writer;
 
 /// 版本号（== Cargo.toml 的 workspace.package.version）
