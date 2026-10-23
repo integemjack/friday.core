@@ -42,7 +42,7 @@
 | 3 | 模型特征（档位、计费、是不是对话模型）和引擎的推断规则（思考方式、接口自带的思考开关、是不是本机、要不要带回思考、并行调工具、可选的思考档位） | `LLM/Engine/ModelTraits.swift`、`EngineStore.swift`；`llm/engine/ModelTraits.cpp`、`EngineStore.cpp` | 完成（`models.traits`、`engines.rules`；词表和地址规则只剩核心一份） |
 | 3 | 流式解析（句柄：每个 chunk 的负载喂一次、吐出要交给界面的文字；工具调用拼接、复读检测 Repetition、被掐断的判断、流里的额度和限流；SSE 分行和 [DONE] 属于网络传输，留在两端） | `LLM/Engine/OpenAIChatEngine.swift` 的 readStream、`Repetition.swift`；`llm/engine/OpenAIChatEngine.cpp` 的 processChunk、`Repetition.cpp` | 完成（负载原样拼进 `{"chunk":…,"stream":N}` 不用再编码；复读搜索加了下界，结果和原算法对照一致，1.4 MB 正文时每个 chunk 从 343 µs 降到 19 µs：`cargo run --release --example bench_stream [个数]`） |
 | 3 | 请求体拼装（含遮密钥）、不接受的参数（认报错 + 按引擎记住）、重试和限流的等待、上下文超长的报错解析；发请求、闸门、退避计时、网络层临时故障的认法（URLError / QNetworkReply）、Qt 的 errorText 留在两端 | 同上 | 完成（Swift 请求体直接用核心给的字节当 httpBody，比原来少编解码一遍） |
-| 3 | 限流排队的自适应规则（RequestGate）、按上下文上限压历史（ContextFit）、上下文进度环（ContextUsage） | `LLM/Engine/`；`llm/engine/` | |
+| 3 | 限流排队的自适应规则（RequestGate：名额、排队先后、并发上限怎么变；排着的请求怎么等——Swift 的 continuation、Qt 的 Promise——留在两端，按编号由核心说放行哪几个）、按上下文上限压历史（ContextFit，连同各模型的上限、估算校准）、上下文进度环（ContextUsage：估算、缩放、上限、数字写法、服务商报的上限；问服务商的网络请求和「问过没有」留在两端） | `LLM/Engine/RequestGate.swift`、`ContextFit.swift`、`ContextUsage.swift`；`llm/engine/RequestGate.cpp`、`ContextFit.cpp`、`ContextUsage.cpp` | 完成（Qt 的 ContextUsageView.qml 里还有一份 JS 的数字写法，界面上的，留着） |
 | 3 | 网络传输（HTTP、SSE）：先留在两端——URLSession / Qt 走系统代理，Rust 的 HTTP 库默认只认环境变量里的代理 | 同上 | 暂不搬 |
 | 3 | 工具执行：文件、搜索、shell、MCP | `Agent/AgentTools*`、`MCP/`；`agent/`、`mcp/` | |
 | 4 | 智能体循环、子智能体、工作流（有状态：句柄 + 事件回调） | `Agent/AgentRunner.swift`、`SubAgentRunner.swift`；`agent/` | |

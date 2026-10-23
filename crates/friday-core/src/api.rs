@@ -4,15 +4,15 @@
 //! code：`unknownMethod`（没有这个方法）、`invalidParams`（参数不对）、`internal`（核心里出错，C 接口层兜住的 panic 也报这个）。
 //! 时间一律用 Unix 毫秒（`now` 不传 = 现在），时长一律用秒（浮点）。
 //!
-//! 方法按模块分组（`quota.*`、`tools.*`、`secrets.*`、`vault.*`、`fold.*`、`conversations.*`、`diff.*`、`journal.*`、`engines.*`、`prompts.*`、`promptHistory.*`、`models.*`、`stream.*`、`repetition.*`、`chat.*`）。有状态的（`vault.*`、`journal.*`、`stream.*`）先 open 拿句柄，后面的方法带上它，每个方法的参数和结果写在下面各自的函数上。
+//! 方法按模块分组（`quota.*`、`tools.*`、`secrets.*`、`vault.*`、`fold.*`、`conversations.*`、`diff.*`、`journal.*`、`engines.*`、`prompts.*`、`promptHistory.*`、`models.*`、`stream.*`、`repetition.*`、`chat.*`、`gate.*`、`context.*`）。有状态的（`vault.*`、`journal.*`、`stream.*`）先 open 拿句柄，后面的方法带上它，每个方法的参数和结果写在下面各自的函数上。
 
 use serde_json::{Map, Value, json};
 
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    chat_request, chat_stream, conversations, engines, folding, journal, line_diff, model_traits, prompt_history, prompts, quota,
-    repetition, secret_guard, secret_store, tool_aliases,
+    chat_request, chat_stream, context, conversations, engines, folding, gate, journal, line_diff, model_traits, prompt_history, prompts,
+    quota, repetition, secret_guard, secret_store, tool_aliases,
 };
 
 #[derive(Debug)]
@@ -389,6 +389,133 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
         // {status, body} → {promptTokens, contextTokens} | null（是不是上下文超长；数字拿不到的是 0）
         "chat.contextOverflow" => Ok(chat_request::context_overflow(int(params, "status")?, &string(params, "body")?)
             .map_or(Value::Null, |(prompt, context)| json!({ "promptTokens": prompt, "contextTokens": context }))),
+        // 请求并发闸门（按引擎 id 共用）：排着的请求由两端编号、自己等，这里说放行哪几个（admitted）。note：并发上限变了，记进日志
+        // {engineID, initial?} → null（第一次建按 initial，之后不再起作用）
+        "gate.create" => {
+            let initial = params.get("initial").and_then(Value::as_i64);
+            gate::with(&string(params, "engineID")?, initial, |_| ());
+            Ok(Value::Null)
+        }
+        // {engineID} → 拿到名额没有（没人排队、还有名额才拿到）
+        "gate.tryAcquire" => Ok(Value::from(gate::with(&string(params, "engineID")?, None, |gate| gate.try_acquire()))),
+        // {engineID, id, priority} → [admitted]（排队；可能马上就放行它自己）
+        "gate.enqueue" => {
+            let (id, priority) = (handle(params, "id")?, int(params, "priority")?);
+            Ok(Value::from(gate::with(&string(params, "engineID")?, None, |gate| gate.enqueue(id, priority))))
+        }
+        // {engineID, id, refund?} → {removed, admitted}（不排了；refund：已经放行却不要了，退回名额）
+        "gate.cancel" => {
+            let (id, refund) = (handle(params, "id")?, params.get("refund").and_then(Value::as_bool).unwrap_or(false));
+            let (removed, admitted) = gate::with(&string(params, "engineID")?, None, |gate| gate.cancel(id, refund));
+            Ok(json!({ "removed": removed, "admitted": admitted }))
+        }
+        // {engineID, outcome: ok | rateLimited | failed} → {admitted, note?}
+        "gate.release" => {
+            let outcome = match string(params, "outcome")?.as_str() {
+                "ok" => gate::Outcome::Ok,
+                "rateLimited" => gate::Outcome::RateLimited,
+                "failed" => gate::Outcome::Failed,
+                other => return Err(ApiError::invalid(format!("outcome 要是 ok / rateLimited / failed：{other}"))),
+            };
+            let change = gate::with(&string(params, "engineID")?, None, |gate| gate.release(outcome, std::time::Instant::now()));
+            Ok(json!({ "admitted": change.admitted, "note": change.note }))
+        }
+        // {engineID, ceiling} → {admitted, note?}（本地大模型报它同时能算几个）
+        "gate.follow" => {
+            let ceiling = int(params, "ceiling")?;
+            let change = gate::with(&string(params, "engineID")?, None, |gate| gate.follow(ceiling, std::time::Instant::now()));
+            Ok(json!({ "admitted": change.admitted, "note": change.note }))
+        }
+        // {engineID} → {limit, inFlight, waiting}
+        "gate.snapshot" => {
+            let (limit, in_flight, waiting) = gate::with(&string(params, "engineID")?, None, |gate| gate.snapshot());
+            Ok(json!({ "limit": limit, "inFlight": in_flight, "waiting": waiting }))
+        }
+        // {} → null（测试用：清掉全部闸门）
+        "gate.reset" => {
+            gate::reset();
+            Ok(Value::Null)
+        }
+
+        // {limit} → {reserve, threshold, target}（按上下文上限压历史：超过 threshold 才压，一压压到 target）
+        "context.budget" => {
+            let limit = int(params, "limit")?;
+            Ok(json!({ "reserve": context::reserve(limit), "threshold": context::threshold(limit), "target": context::target(limit) }))
+        }
+        // {history, folded, budget, summaries?: {echoesReasoning, taskStateTool, wholeTools}}
+        //   → {shortened, dropped, before, after, folded, history?}（压了才带 history；summaries 不给用默认的摘要）
+        "context.compact" => {
+            let mut history = list(params, "history")?;
+            let mut folded = usize::try_from(int(params, "folded")?).map_err(|_| ApiError::invalid("folded 不能是负数"))?;
+            let summaries = match params.get("summaries") {
+                Some(Value::Object(summaries)) => Some(context::Summaries {
+                    echoes_reasoning: summaries.get("echoesReasoning").and_then(Value::as_bool).unwrap_or(false),
+                    special: special(summaries)?,
+                }),
+                _ => None,
+            };
+            let result = context::compact(&mut history, &mut folded, int(params, "budget")?, summaries.as_ref());
+            let mut out = json!({
+                "shortened": result.shortened, "dropped": result.dropped, "before": result.before, "after": result.after, "folded": folded,
+            });
+            if result.shortened > 0 || result.dropped > 0 {
+                out["history"] = Value::Array(history);
+            }
+            Ok(out)
+        }
+        // {count} → 整段去掉的地方留的说明
+        "context.omittedNote" => Ok(Value::from(context::omitted_note(int(params, "count")?.max(0) as usize))),
+        // {key} → 上限 | null；{key, limit} → null（key：引擎 id|模型；本地大模型问到的、请求超长时报的）
+        "context.knownLimit" => Ok(context::known_limit(&string(params, "key")?).map_or(Value::Null, Value::from)),
+        "context.rememberLimit" => {
+            context::remember_limit(&string(params, "key")?, int(params, "limit")?);
+            Ok(Value::Null)
+        }
+        // {key} → 估算的校准系数（没量过是 1）；{key, ratio} → null（记成 0.5–4）
+        "context.ratio" => Ok(Value::from(context::ratio(&string(params, "key")?))),
+        "context.rememberRatio" => {
+            context::remember_ratio(&string(params, "key")?, params.get("ratio").and_then(Value::as_f64).unwrap_or(1.0));
+            Ok(Value::Null)
+        }
+        // {baseURL, model} → 服务商报的上限 | null；{baseURL, entries: [{id, contextLength?}]} → null
+        "context.providerLimit" => {
+            Ok(context::provider_limit(&string(params, "baseURL")?, &string(params, "model")?).map_or(Value::Null, Value::from))
+        }
+        "context.rememberProvider" => {
+            let entries: Vec<(String, i64)> = list(params, "entries")?
+                .iter()
+                .filter_map(|entry| Some((entry.get("id")?.as_str()?.to_string(), entry.get("contextLength")?.as_i64()?)))
+                .collect();
+            context::remember_provider(&string(params, "baseURL")?, &entries);
+            Ok(Value::Null)
+        }
+        // {engineID, baseURL, model, fallback} → {tokens, guessed}（fallback：设置里的最大上下文长度）
+        "context.limit" => {
+            let (tokens, guessed) = context::limit(
+                &string(params, "engineID")?,
+                &string(params, "baseURL")?,
+                &string(params, "model")?,
+                int(params, "fallback")?,
+            );
+            Ok(json!({ "tokens": tokens, "guessed": guessed }))
+        }
+        // {instructions?, toolBytes, history} → {system, tools, user, replies, toolUse}（按字数估算）
+        "context.parts" => {
+            let tool_bytes = params.get("toolBytes").and_then(Value::as_i64).unwrap_or(0);
+            Ok(context::Parts::estimate(&string(params, "instructions")?, tool_bytes, &list(params, "history")?).to_json())
+        }
+        // {parts, total} → parts（等比例缩放到合计 total）
+        "context.scaleParts" => Ok(context::Parts::from_json(&object(params, "parts")?).scaled(int(params, "total")?).to_json()),
+        // {tokens} → 「1.2K」「131K」「1M」
+        "context.compactNumber" => Ok(Value::from(context::compact_number(int(params, "tokens")?))),
+        // {fit?, provider?} → null（测试用：fit 忘掉记住的上限和校准，provider 忘掉服务商报的；都不给就都忘）
+        "context.reset" => {
+            let (fit, provider) = (params.get("fit").and_then(Value::as_bool), params.get("provider").and_then(Value::as_bool));
+            let both = fit.is_none() && provider.is_none();
+            context::reset(both || fit == Some(true), both || provider == Some(true));
+            Ok(Value::Null)
+        }
+
         // {showReasoning, quota} → {stream}（一段请求一个；quota：流里的报错要不要按额度用完认）
         "stream.open" => {
             let flag = |key: &str| params.get(key).and_then(Value::as_bool).unwrap_or(false);
