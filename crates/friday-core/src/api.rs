@@ -12,8 +12,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     chat_request, chat_stream, context, conversations, engines, events, file_changes, file_edit, file_search, folding, gate, journal,
-    line_diff, model_traits, prompt_history, prompts, quota, repetition, secret_guard, secret_store, shell_rules, tool_aliases, tool_defs,
-    tool_files,
+    line_diff, mcp_config, model_traits, prompt_history, prompt_store, prompts, quota, repetition, secret_guard, secret_store, shell_rules,
+    swift_json, tool_aliases, tool_defs, tool_files,
 };
 
 #[derive(Debug)]
@@ -943,6 +943,72 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
 
         // {} → {gitBase: [每次都带的 git 设置], logArguments: [读历史用的参数]}
         "promptHistory.git" => Ok(json!({ "gitBase": prompt_history::GIT_BASE, "logArguments": prompt_history::LOG_ARGUMENTS })),
+        // {value, pretty?} → 文字（== Swift JSONEncoder [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]；pretty: false 是紧凑的）
+        "json.format" => {
+            let value = params.get("value").cloned().unwrap_or(Value::Null);
+            let pretty = params.get("pretty").and_then(Value::as_bool).unwrap_or(true);
+            Ok(Value::from(if pretty { swift_json::pretty(&value) } else { swift_json::compact(&value) }))
+        }
+        // MCP 的配置（见 mcp_config.rs）。{text, fallbackName?} → {servers: {名字: 配置}} | {failure: {kind: invalid | failed, message}}
+        "mcp.parseServers" => {
+            let fallback = params.get("fallbackName").and_then(Value::as_str);
+            Ok(match mcp_config::parse_servers(&string(params, "text")?, fallback) {
+                Ok(servers) => json!({ "servers": servers }),
+                Err((invalid, message)) => json!({ "failure": { "kind": if invalid { "invalid" } else { "failed" }, "message": message } }),
+            })
+        }
+        // {name} → server 名合不合法
+        "mcp.isValidName" => Ok(Value::from(mcp_config::is_valid_name(&string(params, "name")?))),
+        // {server, tool} → 工具的全名
+        "mcp.qualifiedName" => Ok(Value::from(mcp_config::qualified_name(&string(params, "server")?, &string(params, "tool")?))),
+        // {file} → 类型检查的失败原因 | null（file 是整个 mcp.json 的对象）
+        "mcp.decodeProblem" => Ok(mcp_config::decode_problem(&object(params, "file")?).map_or(Value::Null, Value::from)),
+        // {path} → {mcpServers: {…}}（读不出、格式不对都是空的）
+        "mcp.load" => Ok(Value::Object(mcp_config::load(std::path::Path::new(&string(params, "path")?)))),
+        // {path} → 编辑框里的原文
+        "mcp.configText" => Ok(Value::from(mcp_config::config_text(std::path::Path::new(&string(params, "path")?)))),
+        // {path, text} → 空 = 存好了，否则原因（先查格式，对了原样写）
+        "mcp.saveText" => Ok(Value::from(
+            mcp_config::save_text(std::path::Path::new(&string(params, "path")?), &string(params, "text")?).err().unwrap_or_default(),
+        )),
+        // {path, servers} → 空 = 存好了，否则原因（按 Swift JSONEncoder 的写法写回）
+        "mcp.save" => Ok(Value::from(
+            mcp_config::save(std::path::Path::new(&string(params, "path")?), &object(params, "servers")?).err().unwrap_or_default(),
+        )),
+        // 提示词文件夹（见 prompt_store.rs；状态推 promptStore.state，段变了推 promptStore.promptsChanged）。
+        // {git?: 路径 | null（给了就用，不给 = 在 git 的队列里请两端找：promptStore.findGit）, environment?: {名字: 值}, version} → 状态
+        "promptStore.start" => {
+            let environment: Vec<(String, String)> = string_map(params, "environment")?.into_iter().collect();
+            Ok(prompt_store::start(given_git(params), environment, &string(params, "version")?))
+        }
+        // {git?} → null（重新找 git、读历史）
+        "promptStore.refresh" => {
+            prompt_store::refresh(given_git(params));
+            Ok(Value::Null)
+        }
+        // {id, message?} → 接了没有（正在忙、没装 git 不接）
+        "promptStore.rollback" => {
+            let message = params.get("message").and_then(Value::as_str).map(str::to_string);
+            Ok(Value::from(prompt_store::rollback(&string(params, "id")?, message)))
+        }
+        // {} → 接了没有
+        "promptStore.restoreBundled" => Ok(Value::from(prompt_store::restore_bundled())),
+        // {sections: {键: 文字}, message, token?} → 空 = 好了，否则原因（token 给了的提交完推 promptStore.committed {token, version}）
+        "promptStore.applySections" => {
+            let sections = string_map(params, "sections")?.into_iter().collect();
+            let token = params.get("token").and_then(Value::as_str).map(str::to_string);
+            Ok(Value::from(prompt_store::apply_sections(&sections, &string(params, "message")?, token)))
+        }
+        // {timeoutMs?} → {idle, state}（马上看一遍文件、把要提交的提交掉，等 git 跑完；在调用的线程上等）
+        "promptStore.settle" => {
+            let timeout = std::time::Duration::from_millis(params.get("timeoutMs").and_then(Value::as_u64).unwrap_or(10_000));
+            let idle = prompt_store::settle(timeout);
+            Ok(json!({ "idle": idle, "state": prompt_store::state() }))
+        }
+        // {id} → {键: 文字}（那个版本的全部段；在调用的线程上跑 git）
+        "promptStore.sectionsAt" => Ok(to_value(prompt_store::sections_at(&string(params, "id")?))?),
+        // {} → 状态
+        "promptStore.state" => Ok(prompt_store::state()),
         // {version} → 启动时那一次的提交说明（按上次准备提示词时的合并结果）
         "promptHistory.startupMessage" => {
             Ok(Value::from(prompt_history::startup_message(&string(params, "version")?, &prompts::last_merge())))
@@ -1147,6 +1213,15 @@ fn edit_change(params: &Params) -> Result<tool_files::Change, ApiError> {
         new_text: string(params, "newText")?,
         replace_all: flag(params, "replaceAll"),
     })
+}
+
+/// git 参数：不给 = 请两端找（None）；null = 没有；文字 = 路径
+fn given_git(params: &Params) -> Option<Option<String>> {
+    match params.get("git") {
+        None => None,
+        Some(Value::String(git)) if !git.is_empty() => Some(Some(git.clone())),
+        Some(_) => Some(None),
+    }
 }
 
 fn stream_of(params: &Params, body: impl FnOnce(&mut chat_stream::Parser) -> Value) -> Result<Value, ApiError> {

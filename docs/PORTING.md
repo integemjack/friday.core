@@ -37,7 +37,7 @@
 | 4 | 其余存档（capabilities.json、jobs.json、mcp.json、工具和提供方的清单）：读写和各自的注册表搅在一起（迁移、原文原样保存），注册表要看两端的状态、MCP 要事件回调，跟着各自的模块在第 4 阶段搬 | `Capabilities/`、`MCP/`、`Agent/ScriptTools`；`capabilities/`、`mcp/`、`agent/ScriptTools` | |
 | 2 | 提示词引擎（解析、展开参数和引用、装到数据目录、按段三方合并、校验、改一段、恢复成自带的、临时换一套段） | `Prompts/Prompts.swift`；`util/Prompts.cpp` | 完成（两端导出的全部提示词和旧实现逐字一样：`FRIDAY_PROMPT_DUMP`） |
 | 2 | 提示词版本历史里两端都要的规则（git 设置、git log 解成版本、提交说明、自动回滚的判断、上次提交时用的段） | `Prompts/PromptStore.swift`；`models/PromptStore.cpp` | 完成 |
-| 4 | PromptStore 其余部分（跑 git、每秒看文件、停一会儿再提交、界面状态）：要核心能主动通知两端（段变了、git 跑完了），等事件回调 | 同上 | |
+| 4 | PromptStore 其余部分（每秒看文件、停一会儿再提交、跑 git、界面状态）；找 git 留在两端（Swift 由核心在 git 队列里请两端找，Qt 启动时同步找好交给核心） | `Prompts/PromptStore.swift`；`models/PromptStore.cpp` | 完成（Qt 原来用 QFileSystemWatcher，改成和 Swift 一样每秒看一次） |
 | 3 | 工具定义：内置工具的清单（名字、标题、图标、权限、参数；Qt 图标库缺的三个给替代图标）、spec 拼法（说明取提示词 tool.<名字>.<参数>）、参数的 schema、调用前查必填参数 | `Agent/AgentTools.swift`、`ToolTypes.swift`、`ToolRegistry.swift` 的预检；`agent/AgentTools.cpp`、`ToolTypes.cpp`、`ToolRegistry.cpp` | 完成（ToolRegistry 其余的调度、元工具、脚本工具要看两端的状态，第 4 阶段） |
 | 3 | 模型特征（档位、计费、是不是对话模型）和引擎的推断规则（思考方式、接口自带的思考开关、是不是本机、要不要带回思考、并行调工具、可选的思考档位） | `LLM/Engine/ModelTraits.swift`、`EngineStore.swift`；`llm/engine/ModelTraits.cpp`、`EngineStore.cpp` | 完成（`models.traits`、`engines.rules`；词表和地址规则只剩核心一份） |
 | 3 | 流式解析（句柄：每个 chunk 的负载喂一次、吐出要交给界面的文字；工具调用拼接、复读检测 Repetition、被掐断的判断、流里的额度和限流；SSE 分行和 [DONE] 属于网络传输，留在两端） | `LLM/Engine/OpenAIChatEngine.swift` 的 readStream、`Repetition.swift`；`llm/engine/OpenAIChatEngine.cpp` 的 processChunk、`Repetition.cpp` | 完成（负载原样拼进 `{"chunk":…,"stream":N}` 不用再编码；复读搜索加了下界，结果和原算法对照一致，1.4 MB 正文时每个 chunk 从 343 µs 降到 19 µs：`cargo run --release --example bench_stream [个数]`） |
@@ -46,7 +46,10 @@
 | 3 | 网络传输（HTTP、SSE）：先留在两端——URLSession / Qt 走系统代理，Rust 的 HTTP 库默认只认环境变量里的代理 | 同上 | 暂不搬 |
 | 3 | 工具执行：列目录、读写文件、改文件（FileEdit）、找文件和搜内容（FileSearch）、路径提示、命令前后的改动（FileChanges，扫描和读文件都在核心）、run_shell 的规则（超时、拒绝结束自己、结果后的提示、结果写法）、截断 / 分页 / 去 HTML；起进程、联网（web_search、fetch_url）、读媒体文件、会话改动的原文留在两端 | `Agent/AgentTools.swift`、`FileEdit.swift`、`FileSearch.swift`、`FileChanges.swift`；`agent/AgentTools.cpp`、`ToolTypes.cpp`（ToolFiles）、`FileSearch.cpp`、`FileChanges.cpp` | 完成（Qt 的 FileEdit 删了；报错文案照 Qt 逐字复刻的 Cocoa 中文说明；结束 Friday 的规则用 Qt 那份（多认 friday-server / friday-headless）；去 HTML 时 &amp; 放最后解） |
 | 4 | MCP（起 server 进程、JSON-RPC、通知、重连；Swift 用 MCP SDK、Qt 自己写的客户端）：有状态、要事件回调 | `MCP/`；`mcp/` | |
-| 4 | 智能体循环、子智能体、工作流（有状态：句柄 + 事件回调） | `Agent/AgentRunner.swift`、`SubAgentRunner.swift`；`agent/` | |
+| 4 | 事件回调：核心推事件、请两端做事再等回话（`friday_core_set_event_handler`，ABI 2；见 ARCHITECTURE.md §2.3） | `Core/CoreEvents.swift`；`util/CoreBridge` | 完成 |
+| 4 | 会话存储（增删改、分叉、落盘防抖，界面观察的快照） | `Models/ConversationStore.swift`；`models/ConversationStore.cpp` | |
+| 4 | 引擎的对话循环（请求 → 流式 → 工具调用 → 续写、复读处理、收尾）：发 HTTP、跑工具经「请两端做事」 | `LLM/Engine/OpenAIChatEngine.swift` 的 run；`llm/engine/OpenAIChatEngine.cpp` | |
+| 4 | 智能体循环（AgentRunner：一轮的调度、审批、恢复、看门狗）、子智能体、工作流、团队调度 | `Agent/AgentRunner.swift`、`SubAgentRunner.swift`、`Workflow.swift`、`AgentTeamControl.swift`；`agent/` | |
 | 5 | 远程服务端（照 REMOTE.md） | Qt `remote/` | |
 
 **会话存储本身（ConversationStore：增删改、分叉、落盘的防抖）和智能体循环一起搬（第 4 阶段）**：流式生成时每个字都改一次正在写的消息，

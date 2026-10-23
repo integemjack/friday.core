@@ -16,6 +16,7 @@ friday.core 把这部分收成一份 Rust，两边**静态链接**、进程内�
 | `friday_core_free(text)` | 放掉上面返回的字符串 |
 | `friday_core_version()` | 版本号 |
 | `friday_core_abi_version()` | C 接口版本，和头文件的 `FRIDAY_CORE_ABI_VERSION` 比 |
+| `friday_core_set_event_handler(handler, context)` | v2.79（ABI 2）交给核心一个回调：核心推事件、请两端做事（见 §2.3） |
 
 为什么用「方法名 + JSON」而不是每个功能一个 C 函数：
 
@@ -47,6 +48,19 @@ friday.core 把这部分收成一份 Rust，两边**静态链接**、进程内�
 `vault.close` 关掉；核心里加锁，库一变就更新给 `secrets.*` 用的那份值。以后其余有状态的部分（会话、智能体运行）用句柄：`*.open` 返回 id，后续方法带上它；
 需要推送事件时（流式输出、状态变化）加一个注册回调的函数，回调在核心的线程上调，两边各自排回主线程——同 Friday 里
 通话内核（`FridayCall.h`）的做法。
+
+### 2.3 事件和「请两端做事」（ABI 2，第 4 阶段起）
+
+核心有状态的部分（看文件、跑 git、以后的智能体循环）要主动找两端。两端在第一次登记处理时把一个 C 回调交给核心，核心在自己的线程上调它，
+传一段 JSON（实现在 `crates/friday-core/src/events.rs`）：
+
+- 事件：`{"event": "<名字>", "data": {…}}`，比如 `promptStore.state`（完整快照，带递增的 `revision`，两端只收比手上新的）；
+- 请求：`{"event": "request", "request": <编号>, "kind": "<要做的事>", "data": {…}}`，两端做完调 `core.reply`
+  （`{request, result}` 或 `{request, error}`），核心那边等着的线程拿到结果接着走。用在核心做不了的事上：找 git、以后发 HTTP（走系统代理）、跑工具、问用户。
+
+回调里不能卡住、不能同步调回核心：两端收到就排到自己的线程。Swift `Core/CoreEvents.swift`：`CoreEvents.on(事件)`、`CoreEvents.handle(请求)`
+在主线程上调，返回的 `Subscription` 留着就一直收；Qt `CoreBridge::on / handle(名字, context, 处理)` 排进 context 所在线程的事件循环，context 删掉就不收。
+请求没人处理时两端直接回报错。`core.ping`、`core.testRequest` 给两端自检用。
 
 ## 3. 两边怎么接
 
