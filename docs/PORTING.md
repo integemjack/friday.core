@@ -47,7 +47,7 @@
 | 3 | 工具执行：列目录、读写文件、改文件（FileEdit）、找文件和搜内容（FileSearch）、路径提示、命令前后的改动（FileChanges，扫描和读文件都在核心）、run_shell 的规则（超时、拒绝结束自己、结果后的提示、结果写法）、截断 / 分页 / 去 HTML；起进程、联网（web_search、fetch_url）、读媒体文件、会话改动的原文留在两端 | `Agent/AgentTools.swift`、`FileEdit.swift`、`FileSearch.swift`、`FileChanges.swift`；`agent/AgentTools.cpp`、`ToolTypes.cpp`（ToolFiles）、`FileSearch.cpp`、`FileChanges.cpp` | 完成（Qt 的 FileEdit 删了；报错文案照 Qt 逐字复刻的 Cocoa 中文说明；结束 Friday 的规则用 Qt 那份（多认 friday-server / friday-headless）；去 HTML 时 &amp; 放最后解） |
 | 4 | MCP（起 server 进程、JSON-RPC、通知、重连；Swift 用 MCP SDK、Qt 自己写的客户端）：有状态、要事件回调 | `MCP/`；`mcp/` | |
 | 4 | 事件回调：核心推事件、请两端做事再等回话（`friday_core_set_event_handler`，ABI 2；见 ARCHITECTURE.md §2.3） | `Core/CoreEvents.swift`；`util/CoreBridge` | 完成 |
-| 4 | 会话存储（增删改、分叉、落盘防抖，界面观察的快照） | `Models/ConversationStore.swift`；`models/ConversationStore.cpp` | |
+| 4 | 会话存储：落盘（核心留一份存档，两端只交改过的会话和顺序，核心在后台拼整份写；空白不写、只剩草稿的写；序号防先后乱；落盘间隔按编码耗时）、fork 新会话的拼法；增删改、防抖计时、界面观察的数组、正在生成的那条、搜索留在两端 | `Models/ConversationStore.swift`；`models/ConversationStore.cpp` | 完成（`archive.*`、`conversations.fork`；以前每次落盘编码整份存档，现在只编码改过的几段，没改的照核心读入时留着的写，两端认不出的字段也不丢；fork 带上任务模式（Swift 原来没带，按 Qt）；Qt 的落盘间隔原来固定 3 秒，现在和 Swift 一样按耗时放大；搜索要 Unicode 的分解和大小写折叠表，两端系统自带，核心没有这类依赖，留在两端） |
 | 4 | 引擎的对话循环（历史、收尾、按会话折叠、本地大模型压历史、超长重发、统计、复读处理、截断续写、工具结果和截图、说了没做的提醒） | `LLM/Engine/OpenAIChatEngine.swift` 的 run；`llm/engine/OpenAIChatEngine.cpp` | 完成（`loop.*` 句柄，两端只照着执行：发 HTTP、跑工具、问本机上限；参数不是合法 JSON 的工具调用历史里记 "{}"（Qt 原来的做法）） |
 | 4 | 智能体循环（AgentRunner：一轮的调度、审批、恢复、看门狗）、子智能体、工作流、团队调度 | `Agent/AgentRunner.swift`、`SubAgentRunner.swift`、`Workflow.swift`、`AgentTeamControl.swift`；`agent/` | |
 | 5 | 远程服务端（照 REMOTE.md） | Qt `remote/` | |

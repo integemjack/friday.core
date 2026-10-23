@@ -4,16 +4,17 @@
 //! code：`unknownMethod`（没有这个方法）、`invalidParams`（参数不对）、`internal`（核心里出错，C 接口层兜住的 panic 也报这个）。
 //! 时间一律用 Unix 毫秒（`now` 不传 = 现在），时长一律用秒（浮点）。
 //!
-//! 方法按模块分组（`quota.*`、`tools.*`、`secrets.*`、`vault.*`、`fold.*`、`conversations.*`、`diff.*`、`journal.*`、`engines.*`、`prompts.*`、`promptHistory.*`、`models.*`、`stream.*`、`repetition.*`、`chat.*`、`gate.*`、`context.*`、`edit.*`、`files.*`、`changes.*`、`shell.*`、`tools.*`）。有状态的（`vault.*`、`journal.*`、`stream.*`）先 open 拿句柄，后面的方法带上它，每个方法的参数和结果写在下面各自的函数上。
+//! 方法按模块分组（`quota.*`、`tools.*`、`secrets.*`、`vault.*`、`fold.*`、`conversations.*`、`diff.*`、`archive.*`、`journal.*`、`engines.*`、`prompts.*`、`promptHistory.*`、`models.*`、`stream.*`、`repetition.*`、`chat.*`、`gate.*`、`context.*`、`edit.*`、`files.*`、`changes.*`、`shell.*`、`tools.*`）。有状态的（`vault.*`、`journal.*`、`stream.*`）先 open 拿句柄，后面的方法带上它，每个方法的参数和结果写在下面各自的函数上。
 
 use serde_json::{Map, Value, json};
 
 use std::collections::{HashMap, HashSet};
 
+use crate::chat_models::Conversation;
 use crate::{
-    chat_request, chat_stream, context, conversations, engine_loop, engines, events, file_changes, file_edit, file_search, folding, gate,
-    journal, line_diff, mcp_config, model_traits, prompt_history, prompt_store, prompts, quota, repetition, secret_guard, secret_store,
-    shell_rules, swift_json, tool_aliases, tool_defs, tool_files,
+    archive, chat_request, chat_stream, context, conversations, engine_loop, engines, events, file_changes, file_edit, file_search,
+    folding, gate, journal, line_diff, mcp_config, model_traits, prompt_history, prompt_store, prompts, quota, repetition, secret_guard,
+    secret_store, shell_rules, swift_json, tool_aliases, tool_defs, tool_files,
 };
 
 #[derive(Debug)]
@@ -307,6 +308,42 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
             let path = string(params, "path")?;
             let loaded = conversations::load(std::path::Path::new(&path), &string_list(params, "teamTools")?);
             serde_json::to_value(loaded).map_err(|error| ApiError { code: "internal", message: error.to_string() })
+        }
+
+        // {path, teamTools} → {archive, conversations}（同 conversations.load，核心留一份存档，之后落盘只交改过的会话；
+        //   path 为空：两端自己读的 / 测试用的，conversations 给初始内容，不读文件）
+        "archive.open" => {
+            let path = std::path::PathBuf::from(string(params, "path")?);
+            if params.contains_key("conversations") {
+                let items = conversations_of(params, "conversations")?;
+                return Ok(json!({ "archive": archive::open_with(path, items) }));
+            }
+            let (id, loaded) = archive::open(path, &string_list(params, "teamTools")?);
+            Ok(json!({ "archive": id, "conversations": to_value(loaded)? }))
+        }
+        // {archive} → null
+        "archive.close" => {
+            archive::close(handle(params, "archive")?);
+            Ok(Value::Null)
+        }
+        // {archive, seq, order, changed, encodeSeconds?} → {interval, missing}（后台写盘；seq 递增，旧的不覆盖新的；
+        //   interval：生成过程中下一次强制落盘的间隔（秒）；missing：顺序里有、核心还没有内容的会话 id）
+        "archive.save" => {
+            let id = handle(params, "archive")?;
+            let seq = params.get("seq").and_then(Value::as_u64).unwrap_or(0);
+            let encode = params.get("encodeSeconds").and_then(Value::as_f64).unwrap_or(0.0);
+            let changed = conversations_of(params, "changed")?;
+            let (interval, missing) = archive::save(id, seq, string_list(params, "order")?, changed, encode)
+                .ok_or_else(|| ApiError::invalid(format!("没有这个存档：{id}")))?;
+            Ok(json!({ "interval": interval, "missing": missing }))
+        }
+        // {conversation, through, id?} → Conversation（从 through 这条消息处 fork 出的新会话：当前路径到它为止、消息换新 id、
+        //   标题加「（fork）」，大脑 / 目录 / 权限 / 深度思考 / 任务模式照旧；id：指定新会话的 id）
+        "conversations.fork" => {
+            let source: Conversation = serde_json::from_value(Value::Object(object(params, "conversation")?))
+                .map_err(|error| ApiError::invalid(format!("conversation 解不出来：{error}")))?;
+            let new_id = params.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()).map(str::to_string);
+            to_value(archive::fork(&source, &string(params, "through")?, new_id))
         }
 
         // {conversations, teamTools} → [Conversation]（同 conversations.load，规整内存里的会话）
@@ -1203,6 +1240,10 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
 
         _ => Err(ApiError { code: "unknownMethod", message: format!("没有这个方法：{method}") }),
     }
+}
+
+fn conversations_of(params: &Params, key: &str) -> Result<Vec<Conversation>, ApiError> {
+    serde_json::from_value(Value::Array(list(params, key)?)).map_err(|error| ApiError::invalid(format!("{key} 解不出来：{error}")))
 }
 
 fn string(params: &Params, key: &str) -> Result<String, ApiError> {

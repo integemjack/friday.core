@@ -4,6 +4,7 @@
 //! 从两端各写一份的逻辑一块一块搬过来（docs/PORTING.md）；搬过来的一块，两端原来的实现就只剩调用这里的薄包装。
 
 pub mod api;
+pub mod archive;
 pub mod chat_models;
 pub mod chat_request;
 pub mod chat_stream;

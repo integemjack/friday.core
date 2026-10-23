@@ -1,4 +1,4 @@
-//! 读 conversations.json 时的规整（== 两端 ConversationStore 读入时做的；会话的增删改、落盘的防抖还在两端，见 docs/PORTING.md）：
+//! 读 conversations.json 时的规整（== 两端 ConversationStore 读入时做的；落盘在 archive.rs，会话的增删改、防抖计时还在两端，见 docs/PORTING.md）：
 //! - 一段会话解不出来就跳过它（== Qt；Swift 原来是整份读不出来，存档里一段坏了全部会话都看不到）
 //! - 旧存档没有 nodes、只有线性的 messages：按顺序补上父子关系
 //! - 上次运行在中途退出：还标着「进行中」的统计清掉，什么都没写出来的回复写成「（生成被中断）」；还在「运行中 / 待确认」的
