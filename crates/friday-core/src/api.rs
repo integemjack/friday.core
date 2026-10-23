@@ -12,10 +12,10 @@ use std::collections::{HashMap, HashSet};
 
 use crate::chat_models::Conversation;
 use crate::{
-    agents, approval, archive, chat_request, chat_stream, chooser, context, conversations, delivery, engine_loop, engines, events,
-    file_changes, file_edit, file_search, folding, gate, journal, line_diff, liveness, mcp_client, mcp_config, model_traits,
-    prompt_history, prompt_store, prompts, quota, repetition, secret_guard, secret_store, shell_rules, swift_json, task_state, team,
-    tool_aliases, tool_defs, tool_files,
+    agents, approval, archive, capability_store, chat_request, chat_stream, chooser, context, conversations, delivery, engine_loop,
+    engines, events, file_changes, file_edit, file_search, folding, gate, journal, line_diff, liveness, mcp_client, mcp_config,
+    model_traits, prompt_history, prompt_store, prompts, quota, repetition, script_tools, secret_guard, secret_store, shell_rules,
+    swift_json, task_state, team, tool_aliases, tool_defs, tool_files,
 };
 
 #[derive(Debug)]
@@ -488,6 +488,65 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
             let text = string(params, "text")?;
             Ok(json!({ "requirement": task_state::looks_like_requirement(&text), "rule": task_state::looks_like_rule(&text) }))
         }
+        // {path} → {entries, legacyDisabledKinds}（capabilities.json：三组提供方合在一起、旧版本按能力整体关掉的）
+        "capabilities.loadConfig" => Ok(capability_store::load_config(std::path::Path::new(&string(params, "path")?))),
+        // {path, entries} → null | {failure}（按类型分三组写）
+        "capabilities.saveConfig" => {
+            Ok(match capability_store::save_config(std::path::Path::new(&string(params, "path")?), &list(params, "entries")?) {
+                Ok(()) => Value::Null,
+                Err(failure) => json!({ "failure": failure }),
+            })
+        }
+        // {path} → [任务]（jobs.json）
+        "capabilities.loadJobs" => Ok(json!(capability_store::load_jobs(std::path::Path::new(&string(params, "path")?)))),
+        // {path, jobs} → null | {failure}（只保留最近 50 个）
+        "capabilities.saveJobs" => {
+            Ok(match capability_store::save_jobs(std::path::Path::new(&string(params, "path")?), &list(params, "jobs")?) {
+                Ok(()) => Value::Null,
+                Err(failure) => json!({ "failure": failure }),
+            })
+        }
+        // {manifest} → 补全默认值的清单或 null（脚本工具的 tool.json）
+        "scriptTools.normalize" => Ok(json!(script_tools::normalize_manifest(&object(params, "manifest")?))),
+        // {name} → 工具名合不合法
+        "scriptTools.isValidName" => Ok(json!(script_tools::is_valid_name(&string(params, "name")?))),
+        // {root} → [{manifest, code, directory}]（按名字排）
+        "scriptTools.loadAll" => Ok(json!(script_tools::load_all(std::path::Path::new(&string(params, "root")?)))),
+        // {directory} → {manifest, code, directory} 或 null
+        "scriptTools.load" => Ok(json!(script_tools::load(std::path::Path::new(&string(params, "directory")?)))),
+        // {root, manifest, code} → {manifest, code, directory} | {failure}（存新版本，旧的归档）
+        "scriptTools.save" => Ok(
+            match script_tools::save(std::path::Path::new(&string(params, "root")?), &object(params, "manifest")?, &string(params, "code")?)
+            {
+                Ok(tool) => tool,
+                Err(failure) => json!({ "failure": failure }),
+            },
+        ),
+        // {root, manifest} → null | {failure}（只更新清单）
+        "scriptTools.updateManifest" => {
+            Ok(match script_tools::update_manifest(std::path::Path::new(&string(params, "root")?), &object(params, "manifest")?) {
+                Ok(()) => Value::Null,
+                Err(failure) => json!({ "failure": failure }),
+            })
+        }
+        // {root, name} → [{manifest, code}]（新的在前）
+        "scriptTools.versions" => {
+            Ok(json!(script_tools::versions(std::path::Path::new(&string(params, "root")?), &string(params, "name")?)))
+        }
+        // {exitCode, stdout, stderr, timedOut, timeout} → 运行摘要
+        "scriptTools.summary" => Ok(json!(script_tools::run_summary(
+            params.get("exitCode").and_then(Value::as_i64).unwrap_or(0),
+            &string(params, "stdout")?,
+            &string(params, "stderr")?,
+            flag(params, "timedOut"),
+            params.get("timeout").and_then(Value::as_f64).unwrap_or(60.0)
+        ))),
+        // {stdout, workDirectory, home} → 脚本声明的产出文件（存在的）
+        "scriptTools.mediaPaths" => Ok(json!(script_tools::media_paths(
+            &string(params, "stdout")?,
+            std::path::Path::new(&string(params, "workDirectory")?),
+            std::path::Path::new(&string(params, "home")?)
+        ))),
         // {name, command?, path?, alwaysConfirm, paid, mode: auto|plan|full, permissionNeedsApproval, stopsSystem, browserStop, powerShell?}
         //   → {needed, forced}（一个调用要不要先问用户；powerShell 不传按这台是不是 Windows）
         "approval.decide" => {

@@ -354,6 +354,14 @@ pub fn create_directory(path: &Path) -> Result<(), String> {
     fs::create_dir_all(&target).map_err(|error| write_failure(&target, is_permission(&error)))
 }
 
+/// == Data.write(to:)（原地写，不建目录）：目录没了报「文件“X”不存在。」，不留下只有这个文件的空壳
+pub fn write_in_place(path: &Path, data: &[u8]) -> Result<(), String> {
+    if !parent_of(path).is_dir() || path.is_dir() {
+        return Err(format!("文件“{}”不存在。", last_component(&display(path))));
+    }
+    fs::write(path, data).map_err(|error| write_failure(path, is_permission(&error)))
+}
+
 /// == String.write(to:atomically: true)：先写同目录里的临时文件再替换（目标只读也能写，权限保留）
 pub fn write_atomically(path: &Path, data: &[u8]) -> Result<(), String> {
     let parent = parent_of(path);
