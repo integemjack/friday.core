@@ -7,6 +7,8 @@ pub mod api;
 pub mod folding;
 pub mod quota;
 pub mod secret_guard;
+pub mod secret_store;
+pub mod swift_json;
 pub mod tool_aliases;
 
 /// 版本号（== Cargo.toml 的 workspace.package.version）

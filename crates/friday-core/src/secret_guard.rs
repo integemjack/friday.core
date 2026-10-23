@@ -91,6 +91,11 @@ impl Guard {
         count
     }
 
+    /// 参与全文匹配的值有几个
+    pub fn known_count(&self) -> usize {
+        self.state.read().unwrap().known.len()
+    }
+
     pub fn is_ignored(&self, value: &str) -> bool {
         self.state.read().unwrap().ignored.contains(&hash(value))
     }

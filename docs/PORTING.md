@@ -13,7 +13,9 @@
 7. 两端各自维护、核心要用的数据（比如库里的密钥值），在两端变化时交给核心（`secrets.update`），核心每个进程存一份；不要每次调用都带上。
 8. 整段请求历史过 C 接口要编解码一次（估算 token、子 Agent 会话折叠每次请求都要）：核心这边 3 MB 约 1 ms，两端的 JSON 编码另算。
    到第 3 阶段在线引擎搬进核心后，历史就在核心里，不用再过来回。
-9. Swift 传 `JSONValue` 这类 Codable 值用 `CoreBridge.call(_:encoding:as:)`，不经过 `Any`（整数和小数不会混）。
+9. 有状态的一块用句柄（`vault.open` → id，后面的方法带上，`vault.close` 关掉）：两端每个实例各持一个，界面要观察的东西每次改动后取快照。
+   存档文件由核心读写，写法照两端原来的（`swift_json::pretty`：Swift JSONEncoder 的 pretty + 键排序），降级回旧版也读得了。
+10. Swift 传 `JSONValue` 这类 Codable 值用 `CoreBridge.call(_:encoding:as:)`，不经过 `Any`（整数和小数不会混）。
 
 ## 顺序
 
@@ -24,7 +26,7 @@
 | 1 | 工具名、参数名纠正（别家叫法换成 Friday 的；「注册表里有没有」留在两端） | `Agent/ToolAliases.swift`；`agent/ToolAliases.cpp` | 完成 |
 | 1 | 密钥识别与替换（认、遮、清理存档、名字合不合法；密钥库本身留在两端的 SecretStore） | `Secrets/SecretGuard.swift`；`secrets/SecretGuard.cpp` | 完成 |
 | 1 | 上下文折叠、会话折叠（摘要、子 Agent 会话的折叠、估算 token；主会话标折叠、调试用的预算开关留在两端） | `Agent/ContextFolding.swift`、`LLM/Engine/SessionFolding.swift`；`agent/ContextFolding.cpp`、`llm/engine/SessionFolding.cpp` | 完成 |
-| 1 | 密钥库：存储、收进库、执行时换回明文 | `Secrets/SecretStore.swift`；`secrets/SecretStore.cpp` | |
+| 1 | 密钥库：存储、收进库、执行时换回明文（句柄；界面观察的名字和记录是快照，远程副本留在两端） | `Secrets/SecretStore.swift`；`secrets/SecretStore.cpp` | 完成 |
 | 1 | 等额度的文案和时间（等到什么时候、消息上那一行、时间和「还有多久」的写法；停下、换大脑、定时检查留在两端） | `Agent/QuotaWaiting.swift`；`agent/QuotaWaiting.cpp` | 完成 |
 | 2 | 数据模型和存档格式（会话、消息块、工具事件的 JSON 与两端完全一致） | `Models/`；`models/` | |
 | 2 | 提示词拼装、工具定义 | `Prompts/`、`Agent/ToolRegistry.swift`；`agent/` | |

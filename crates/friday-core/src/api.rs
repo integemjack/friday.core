@@ -4,13 +4,13 @@
 //! code：`unknownMethod`（没有这个方法）、`invalidParams`（参数不对）、`internal`（核心里出错，C 接口层兜住的 panic 也报这个）。
 //! 时间一律用 Unix 毫秒（`now` 不传 = 现在），时长一律用秒（浮点）。
 //!
-//! 方法按模块分组（`quota.*`、`tools.*`、`secrets.*`、`fold.*`），每个方法的参数和结果写在下面各自的函数上。
+//! 方法按模块分组（`quota.*`、`tools.*`、`secrets.*`、`vault.*`、`fold.*`）。有状态的（`vault.*`）先 open 拿句柄，后面的方法带上它，每个方法的参数和结果写在下面各自的函数上。
 
 use serde_json::{Map, Value, json};
 
 use std::collections::{HashMap, HashSet};
 
-use crate::{folding, quota, secret_guard, tool_aliases};
+use crate::{folding, quota, secret_guard, secret_store, tool_aliases};
 
 #[derive(Debug)]
 pub struct ApiError {
@@ -169,6 +169,96 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
         // {name} → 密钥名合不合法
         "secrets.isValidName" => Ok(Value::from(secret_guard::is_valid_name(&string(params, "name")?))),
 
+        // {directory?} → {vault, names, auto, known}（打开数据目录里的密钥库；不给 directory：只在内存里的库，不读写文件、不动 SecretGuard；
+        //   auto：{名字: {source, addedAt(毫秒)}}）
+        "vault.open" => {
+            let directory = string(params, "directory")?;
+            let id = secret_store::open((!directory.is_empty()).then(|| std::path::Path::new(&directory)));
+            let mut snapshot = vault(params, id, |vault| vault.snapshot())?;
+            snapshot["vault"] = Value::from(id);
+            Ok(snapshot)
+        }
+        // {vault} → {known}（还有别的库开着就把最后打开的那个的值交给 SecretGuard，都关了才撤掉；known 是 SecretGuard 现在参与全文匹配的个数）
+        "vault.close" => Ok(json!({ "known": secret_store::close(vault_id(params)?) })),
+        // {vault} → {names, auto, known}
+        "vault.snapshot" => vault(params, vault_id(params)?, |vault| vault.snapshot()),
+        // {vault, name} → 值 | null
+        "vault.get" => {
+            let name = string(params, "name")?;
+            vault(params, vault_id(params)?, |vault| vault.get(&name).map_or(Value::Null, Value::from))
+        }
+        // {vault, name, value} → {saved, names, auto, known}（值去掉首尾空白，空的不存）
+        "vault.set" => {
+            let (name, value) = (string(params, "name")?, string(params, "value")?);
+            vault(params, vault_id(params)?, |vault| {
+                let saved = vault.set(&name, &value);
+                if saved {
+                    vault.publish();
+                }
+                with_snapshot(vault, json!({ "saved": saved }))
+            })
+        }
+        // {vault, name} → {names, auto, known}
+        "vault.remove" => {
+            let name = string(params, "name")?;
+            vault(params, vault_id(params)?, |vault| {
+                vault.remove(&name);
+                vault.publish();
+                vault.snapshot()
+            })
+        }
+        // {vault, name} → 只露出前后几位的写法
+        "vault.masked" => {
+            let name = string(params, "name")?;
+            vault(params, vault_id(params)?, |vault| Value::from(vault.masked(&name)))
+        }
+        // {vault, text, source} → {text, changed, names?, auto?, known?}（changed：收进了新的，带上快照）
+        "vault.protect" => {
+            let (text, source) = (string(params, "text")?, string(params, "source")?);
+            vault(params, vault_id(params)?, |vault| {
+                let (protected, changed) = vault.protect(&text, &source);
+                let result = json!({ "text": protected, "changed": changed });
+                if changed { with_snapshot(vault, result) } else { result }
+            })
+        }
+        // {vault, directory, once} → {changed, names, auto, known}
+        "vault.scanHistory" => {
+            let directory = string(params, "directory")?;
+            let once = params.get("once").and_then(Value::as_bool).unwrap_or(false);
+            vault(params, vault_id(params)?, |vault| {
+                let changed = vault.scan_stored_history(std::path::Path::new(&directory), once);
+                with_snapshot(vault, json!({ "changed": changed }))
+            })
+        }
+        // {vault, name} → {changed, names, auto, known}
+        "vault.markNotSecret" => {
+            let name = string(params, "name")?;
+            vault(params, vault_id(params)?, |vault| {
+                let changed = vault.mark_not_secret(&name);
+                with_snapshot(vault, json!({ "changed": changed }))
+            })
+        }
+        // {vault, text} → 换回明文的文本
+        "vault.substitute" => {
+            let text = string(params, "text")?;
+            vault(params, vault_id(params)?, |vault| Value::from(vault.substitute(&text)))
+        }
+        // {vault, value} → 每个字符串都换回明文的 value
+        "vault.substituteJSON" => {
+            let value = params.get("value").cloned().unwrap_or(Value::Null);
+            vault(params, vault_id(params)?, |vault| vault.substitute_json(value))
+        }
+        // {vault, text} → [引用了但库里没有的名字]
+        "vault.missingReferences" => {
+            let text = string(params, "text")?;
+            vault(params, vault_id(params)?, |vault| Value::from(vault.missing_references(&text)))
+        }
+        // {vault, names} → {名字: 值}（只含库里有的）
+        "vault.environment" => {
+            let names = string_list(params, "names")?;
+            vault(params, vault_id(params)?, |vault| json!(vault.environment(&names)))
+        }
+
         // {} → 主会话折叠的预算（估算 token；子 Agent 会话是它的两倍）
         "fold.budget" => Ok(Value::from(folding::BUDGET)),
         // {text} → 较早的回复正文的摘要
@@ -226,6 +316,21 @@ fn list(params: &Params, key: &str) -> Result<Vec<Value>, ApiError> {
 
 fn special(params: &Params) -> Result<folding::Special, ApiError> {
     Ok(folding::Special { task_state: string(params, "taskStateTool")?, whole: string_list(params, "wholeTools")? })
+}
+
+fn vault_id(params: &Params) -> Result<u64, ApiError> {
+    params.get("vault").and_then(Value::as_u64).ok_or_else(|| ApiError::invalid("缺少 vault（vault.open 返回的句柄）"))
+}
+
+fn vault(_params: &Params, id: u64, body: impl FnOnce(&mut secret_store::Vault) -> Value) -> Result<Value, ApiError> {
+    secret_store::with(id, body).ok_or_else(|| ApiError::invalid(format!("没有这个密钥库句柄：{id}（关掉了？）")))
+}
+
+fn with_snapshot(vault: &secret_store::Vault, mut result: Value) -> Value {
+    if let (Value::Object(result), Value::Object(snapshot)) = (&mut result, vault.snapshot()) {
+        result.extend(snapshot);
+    }
+    result
 }
 
 fn string_map(params: &Params, key: &str) -> Result<HashMap<String, String>, ApiError> {
@@ -335,6 +440,7 @@ mod tests {
 
     #[test]
     fn secrets_methods() {
+        let _guard = secret_store::GLOBAL_GUARD_TEST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         // 全局那一份：只用这个测试自己的名字，不和别的测试抢
         let token = concat!("ghp_", "ApiApiApiApiApiApiApiApi0123456789ab");
         let detected = parsed("secrets.detect", &json!({ "text": format!("😀 https://x:{token}@github.com") }).to_string());
@@ -365,6 +471,29 @@ mod tests {
         assert!(result["result"].get("history").is_none());
         params["folded"] = json!(-1);
         assert_eq!(parsed("fold.session", &params.to_string())["error"]["code"], json!("invalidParams"));
+    }
+
+    #[test]
+    fn vault_methods() {
+        let _guard = secret_store::GLOBAL_GUARD_TEST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let directory = std::env::temp_dir().join(format!("friday-core-api-vault-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let opened = parsed("vault.open", &json!({ "directory": directory }).to_string());
+        let id = opened["result"]["vault"].as_u64().unwrap();
+        assert_eq!(opened["result"]["names"], json!([]));
+        let set = parsed("vault.set", &json!({ "vault": id, "name": "API_KEY", "value": " AbCdEf123456 " }).to_string());
+        assert_eq!(set["result"]["saved"], json!(true));
+        assert_eq!(set["result"]["names"], json!(["API_KEY"]));
+        assert_eq!(set["result"]["known"], json!(1));
+        assert_eq!(parsed("vault.get", &json!({ "vault": id, "name": "API_KEY" }).to_string())["result"], json!("AbCdEf123456"));
+        let substituted = parsed("vault.substitute", &json!({ "vault": id, "text": "k=${secret:API_KEY}" }).to_string());
+        assert_eq!(substituted["result"], json!("k=AbCdEf123456"));
+        let environment = parsed("vault.environment", &json!({ "vault": id, "names": ["API_KEY", "X"] }).to_string());
+        assert_eq!(environment["result"], json!({ "API_KEY": "AbCdEf123456" }));
+        assert_eq!(parsed("vault.close", &json!({ "vault": id }).to_string())["result"], json!({ "known": 0 }));
+        assert_eq!(parsed("vault.get", &json!({ "vault": id, "name": "API_KEY" }).to_string())["error"]["code"], json!("invalidParams"));
+        assert_eq!(parsed("vault.get", r#"{"name":"API_KEY"}"#)["error"]["code"], json!("invalidParams"));
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]
