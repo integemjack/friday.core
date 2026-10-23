@@ -41,7 +41,7 @@
 | 3 | 工具定义（参数结构、权限）跟着工具执行一起搬 | `Agent/ToolRegistry.swift`、`AgentTools.swift`；`agent/` | |
 | 3 | 模型特征（档位、计费、是不是对话模型）和引擎的推断规则（思考方式、接口自带的思考开关、是不是本机、要不要带回思考、并行调工具、可选的思考档位） | `LLM/Engine/ModelTraits.swift`、`EngineStore.swift`；`llm/engine/ModelTraits.cpp`、`EngineStore.cpp` | 完成（`models.traits`、`engines.rules`；词表和地址规则只剩核心一份） |
 | 3 | 流式解析（句柄：每个 chunk 的负载喂一次、吐出要交给界面的文字；工具调用拼接、复读检测 Repetition、被掐断的判断、流里的额度和限流；SSE 分行和 [DONE] 属于网络传输，留在两端） | `LLM/Engine/OpenAIChatEngine.swift` 的 readStream、`Repetition.swift`；`llm/engine/OpenAIChatEngine.cpp` 的 processChunk、`Repetition.cpp` | 完成（负载原样拼进 `{"chunk":…,"stream":N}` 不用再编码；复读搜索加了下界，结果和原算法对照一致，1.4 MB 正文时每个 chunk 从 343 µs 降到 19 µs：`cargo run --release --example bench_stream [个数]`） |
-| 3 | 请求体拼装、不接受的参数去掉、重试间隔、上下文超长的报错解析 | 同上 | |
+| 3 | 请求体拼装（含遮密钥）、不接受的参数（认报错 + 按引擎记住）、重试和限流的等待、上下文超长的报错解析；发请求、闸门、退避计时、网络层临时故障的认法（URLError / QNetworkReply）、Qt 的 errorText 留在两端 | 同上 | 完成（Swift 请求体直接用核心给的字节当 httpBody，比原来少编解码一遍） |
 | 3 | 限流排队的自适应规则（RequestGate）、按上下文上限压历史（ContextFit）、上下文进度环（ContextUsage） | `LLM/Engine/`；`llm/engine/` | |
 | 3 | 网络传输（HTTP、SSE）：先留在两端——URLSession / Qt 走系统代理，Rust 的 HTTP 库默认只认环境变量里的代理 | 同上 | 暂不搬 |
 | 3 | 工具执行：文件、搜索、shell、MCP | `Agent/AgentTools*`、`MCP/`；`agent/`、`mcp/` | |

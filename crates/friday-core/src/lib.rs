@@ -5,6 +5,7 @@
 
 pub mod api;
 pub mod chat_models;
+pub mod chat_request;
 pub mod chat_stream;
 pub mod conversations;
 pub mod engines;

@@ -4,15 +4,15 @@
 //! code：`unknownMethod`（没有这个方法）、`invalidParams`（参数不对）、`internal`（核心里出错，C 接口层兜住的 panic 也报这个）。
 //! 时间一律用 Unix 毫秒（`now` 不传 = 现在），时长一律用秒（浮点）。
 //!
-//! 方法按模块分组（`quota.*`、`tools.*`、`secrets.*`、`vault.*`、`fold.*`、`conversations.*`、`diff.*`、`journal.*`、`engines.*`、`prompts.*`、`promptHistory.*`、`models.*`、`stream.*`、`repetition.*`）。有状态的（`vault.*`、`journal.*`、`stream.*`）先 open 拿句柄，后面的方法带上它，每个方法的参数和结果写在下面各自的函数上。
+//! 方法按模块分组（`quota.*`、`tools.*`、`secrets.*`、`vault.*`、`fold.*`、`conversations.*`、`diff.*`、`journal.*`、`engines.*`、`prompts.*`、`promptHistory.*`、`models.*`、`stream.*`、`repetition.*`、`chat.*`）。有状态的（`vault.*`、`journal.*`、`stream.*`）先 open 拿句柄，后面的方法带上它，每个方法的参数和结果写在下面各自的函数上。
 
 use serde_json::{Map, Value, json};
 
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    chat_stream, conversations, engines, folding, journal, line_diff, model_traits, prompt_history, prompts, quota, repetition,
-    secret_guard, secret_store, tool_aliases,
+    chat_request, chat_stream, conversations, engines, folding, journal, line_diff, model_traits, prompt_history, prompts, quota,
+    repetition, secret_guard, secret_store, tool_aliases,
 };
 
 #[derive(Debug)]
@@ -339,6 +339,56 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
             journal.clear();
             Value::Null
         }),
+        // {model, instructions?, history, temperature, maxTokens?, tools?, baseURL, thinking, enableThinking, reasoningEffort?, extraBody?,
+        // engineID?, xFriday?, mask?} → 请求体（tools：要带的工具定义，收尾请求、不支持工具的传空；thinking：ThinkingSupport 的原始值；
+        // mask：按密钥库遮一遍）
+        "chat.requestBody" => {
+            let empty = Vec::new();
+            let array = |key: &str| match params.get(key) {
+                None | Some(Value::Null) => Ok(&empty),
+                Some(Value::Array(items)) => Ok(items),
+                Some(_) => Err(ApiError::invalid(format!("{key} 要是数组"))),
+            };
+            let flag = |key: &str| params.get(key).and_then(Value::as_bool).unwrap_or(false);
+            let options = chat_request::BodyOptions {
+                model: string(params, "model")?,
+                instructions: string(params, "instructions")?,
+                history: array("history")?,
+                temperature: params.get("temperature").and_then(Value::as_f64).unwrap_or(0.6),
+                max_tokens: params.get("maxTokens").and_then(Value::as_i64),
+                tools: array("tools")?,
+                base_url: string(params, "baseURL")?,
+                thinking: string(params, "thinking")?,
+                enable_thinking: flag("enableThinking"),
+                reasoning_effort: params.get("reasoningEffort").and_then(Value::as_str).map(str::to_string),
+                extra_body: string(params, "extraBody")?,
+                engine_id: string(params, "engineID")?,
+                x_friday: params.get("xFriday").filter(|value| !value.is_null()).cloned(),
+            };
+            let body = chat_request::request_body(&options);
+            Ok(if flag("mask") { chat_request::masked(body) } else { body })
+        }
+        // {status, text} → [接口说不接受的可选参数]
+        "chat.unsupportedParameters" => {
+            Ok(Value::from(chat_request::unsupported_parameters(int(params, "status")?, &string(params, "text")?)))
+        }
+        // {engineID} → [这个引擎说过不接受的]
+        "chat.unsupportedFor" => Ok(Value::from(chat_request::unsupported_for(&string(params, "engineID")?))),
+        // {engineID, names} → null（记住，本次运行内之后的请求都不带）
+        "chat.rememberUnsupported" => {
+            chat_request::remember_unsupported(&string(params, "engineID")?, &string_list(params, "names")?);
+            Ok(Value::Null)
+        }
+        // {attempt, retryAfter?} → 秒（服务繁忙、连不上时第 attempt 次重试前；retryAfter：秒数或 Retry-After 头的原文）
+        "chat.retryDelay" => Ok(Value::from(chat_request::retry_delay(int(params, "attempt")?, retry_after(params)))),
+        // {attempt, retryAfter?, jitterMs?} → 秒（可重试的 429）
+        "chat.rateLimitDelay" => {
+            let jitter = params.get("jitterMs").and_then(Value::as_i64).unwrap_or(0);
+            Ok(Value::from(chat_request::rate_limit_delay(int(params, "attempt")?, retry_after(params), jitter)))
+        }
+        // {status, body} → {promptTokens, contextTokens} | null（是不是上下文超长；数字拿不到的是 0）
+        "chat.contextOverflow" => Ok(chat_request::context_overflow(int(params, "status")?, &string(params, "body")?)
+            .map_or(Value::Null, |(prompt, context)| json!({ "promptTokens": prompt, "contextTokens": context }))),
         // {showReasoning, quota} → {stream}（一段请求一个；quota：流里的报错要不要按额度用完认）
         "stream.open" => {
             let flag = |key: &str| params.get(key).and_then(Value::as_bool).unwrap_or(false);
@@ -619,6 +669,14 @@ fn journal_of(params: &Params, body: impl FnOnce(&mut journal::Journal) -> Value
     journal::with(id, body).ok_or_else(|| ApiError::invalid(format!("没有这个日志句柄：{id}（关掉了？）")))
 }
 
+fn retry_after(params: &Params) -> Option<f64> {
+    match params.get("retryAfter") {
+        Some(Value::Number(seconds)) => seconds.as_f64(),
+        Some(Value::String(text)) => chat_request::header_seconds(text),
+        _ => None,
+    }
+}
+
 fn stream_of(params: &Params, body: impl FnOnce(&mut chat_stream::Parser) -> Value) -> Result<Value, ApiError> {
     let id = handle(params, "stream")?;
     chat_stream::with(id, body).ok_or_else(|| ApiError::invalid(format!("没有这个流句柄：{id}（关掉了？）")))
@@ -866,5 +924,28 @@ mod tests {
         parsed("stream.close", &json!({ "stream": id }).to_string());
         assert_eq!(parsed("stream.finish", &json!({ "stream": id }).to_string())["error"]["code"], json!("invalidParams"));
         assert_eq!(parsed("repetition.similarity", r#"{"a":"abcd","b":"abcd"}"#)["result"], json!(1.0));
+    }
+
+    #[test]
+    fn chat_request() {
+        let body = parsed(
+            "chat.requestBody",
+            r#"{"model":"m","history":[{"role":"user","content":"hi"}],"temperature":0.3,"baseURL":"https://open.bigmodel.cn/api/paas/v4",
+                "thinking":"effort","enableThinking":true,"reasoningEffort":"high","tools":[{"type":"function"}],"mask":true}"#,
+        )["result"]
+            .clone();
+        assert_eq!(body["messages"], json!([{"role": "user", "content": "hi"}]));
+        assert_eq!((body["temperature"].clone(), body["reasoning_effort"].clone()), (json!(0.3), json!("high")));
+        assert_eq!(body["thinking"], json!({"type": "enabled"}));
+        assert_eq!(body["tools"], json!([{"type": "function"}]));
+        assert_eq!(parsed("chat.retryDelay", r#"{"attempt":2,"retryAfter":" 9"}"#)["result"], json!(9.0));
+        assert_eq!(parsed("chat.retryDelay", r#"{"attempt":2,"retryAfter":"soon"}"#)["result"], json!(4.0));
+        assert_eq!(parsed("chat.rateLimitDelay", r#"{"attempt":1,"jitterMs":250}"#)["result"], json!(2.25));
+        assert_eq!(
+            parsed("chat.contextOverflow", r#"{"status":400,"body":"prompt is too long"}"#)["result"],
+            json!({"promptTokens": 0, "contextTokens": 0})
+        );
+        parsed("chat.rememberUnsupported", r#"{"engineID":"api-test","names":["seed"]}"#);
+        assert_eq!(parsed("chat.unsupportedFor", r#"{"engineID":"api-test"}"#)["result"], json!(["seed"]));
     }
 }
