@@ -4,13 +4,13 @@
 //! code：`unknownMethod`（没有这个方法）、`invalidParams`（参数不对）、`internal`（核心里出错，C 接口层兜住的 panic 也报这个）。
 //! 时间一律用 Unix 毫秒（`now` 不传 = 现在），时长一律用秒（浮点）。
 //!
-//! 方法按模块分组（`quota.*`、`tools.*`、`secrets.*`、`vault.*`、`fold.*`、`conversations.*`、`diff.*`、`journal.*`、`engines.*`）。有状态的（`vault.*`、`journal.*`）先 open 拿句柄，后面的方法带上它，每个方法的参数和结果写在下面各自的函数上。
+//! 方法按模块分组（`quota.*`、`tools.*`、`secrets.*`、`vault.*`、`fold.*`、`conversations.*`、`diff.*`、`journal.*`、`engines.*`、`prompts.*`）。有状态的（`vault.*`、`journal.*`）先 open 拿句柄，后面的方法带上它，每个方法的参数和结果写在下面各自的函数上。
 
 use serde_json::{Map, Value, json};
 
 use std::collections::{HashMap, HashSet};
 
-use crate::{conversations, engines, folding, journal, line_diff, quota, secret_guard, secret_store, tool_aliases};
+use crate::{conversations, engines, folding, journal, line_diff, prompts, quota, secret_guard, secret_store, tool_aliases};
 
 #[derive(Debug)]
 pub struct ApiError {
@@ -348,6 +348,75 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
             to_value(normalized)
         }
 
+        // {bundled: {文件名: 内容}, directory?, platform: [{name, value} | {name, section}]} → {installed, added, updated, keptLocal}
+        //   （两端第一次用到提示词时调：自带的文件、数据目录里的提示词文件夹（不给 = 用不了，全用自带的）、平台参数的取值）
+        "prompts.setup" => {
+            let bundled = string_map(params, "bundled")?.into_iter().collect();
+            let directory = string(params, "directory")?;
+            let mut platform = Vec::new();
+            for item in list(params, "platform")? {
+                let name = item.get("name").and_then(Value::as_str).ok_or_else(|| ApiError::invalid("platform 里每项要有 name"))?;
+                let value = match (item.get("value").and_then(Value::as_str), item.get("section").and_then(Value::as_str)) {
+                    (Some(value), _) => prompts::Platform::Value(value.to_string()),
+                    (None, Some(section)) => prompts::Platform::Section(section.to_string()),
+                    _ => return Err(ApiError::invalid(format!("platform 的 {name} 要有 value 或 section"))),
+                };
+                platform.push((name.to_string(), value));
+            }
+            prompts::setup(bundled, (!directory.is_empty()).then(|| directory.into()), platform);
+            Ok(merge_report(prompts::last_merge()))
+        }
+        // {key, args?, override?} → 展开好的文字（override：prompts.override 返回的句柄）
+        "prompts.text" => {
+            let args: prompts::Args = string_map(params, "args")?.into_iter().collect();
+            Ok(Value::from(prompts::text(&string(params, "key")?, &args, override_id(params))))
+        }
+        // {key, override?} → 有没有这一段
+        "prompts.contains" => Ok(Value::from(prompts::contains(&string(params, "key")?, override_id(params)))),
+        // {override?} → {段名: 原文}（现在实际用的）
+        "prompts.sections" => Ok(json!(prompts::sections(override_id(params)))),
+        // {key, args?} → 自带的那一段展开好的
+        "prompts.bundledText" => {
+            let args: prompts::Args = string_map(params, "args")?.into_iter().collect();
+            Ok(Value::from(prompts::bundled_text(&string(params, "key")?, &args)))
+        }
+        // {key} → 自带的那一段的原文
+        "prompts.bundledSource" => Ok(Value::from(prompts::bundled_source(&string(params, "key")?))),
+        // {} → {directory, fileNames, problems, lastMerge}
+        "prompts.state" => Ok(json!({
+            "directory": prompts::directory().map(|dir| dir.to_string_lossy().into_owned()),
+            "fileNames": prompts::file_names(),
+            "problems": prompts::problems(),
+            "lastMerge": merge_report(prompts::last_merge()),
+        })),
+        // {fileName} → [段名]（按文件里的顺序）
+        "prompts.bundledKeys" => Ok(Value::from(prompts::bundled_keys(&string(params, "fileName")?))),
+        // {key, text} → 行返回空串，不行返回原因
+        "prompts.checkSection" => Ok(Value::from(prompts::check_section(&string(params, "key")?, &string(params, "text")?))),
+        // {} → [内容变了的段名]（重新读数据目录里的文件）
+        "prompts.reload" => Ok(Value::from(prompts::reload())),
+        // {key, text} → 写成了没有
+        "prompts.setSection" => Ok(Value::from(prompts::set_section(&string(params, "key")?, &string(params, "text")?))),
+        // {} → 写成了没有
+        "prompts.restoreBundled" => Ok(Value::from(prompts::restore_bundled())),
+        // {files: [内容]} → {段名: 原文}
+        "prompts.compose" => Ok(json!(prompts::compose(&string_list(params, "files")?))),
+        // {content} → {段名: 正文}
+        "prompts.parse" => Ok(json!(prompts::parse(&string(params, "content")?))),
+        // {sections, key, args?} → 按给定的段展开
+        "prompts.render" => {
+            let sections: prompts::Sections = string_map(params, "sections")?.into_iter().collect();
+            let args: prompts::Args = string_map(params, "args")?.into_iter().collect();
+            Ok(Value::from(prompts::render(&sections, &string(params, "key")?, &args)))
+        }
+        // {sections} → {override}（临时换成这一套段，用完 prompts.release）
+        "prompts.override" => Ok(json!({ "override": prompts::override_sections(string_map(params, "sections")?.into_iter().collect()) })),
+        // {override} → null
+        "prompts.release" => {
+            prompts::release(handle(params, "override")?);
+            Ok(Value::Null)
+        }
+
         // {} → 主会话折叠的预算（估算 token；子 Agent 会话是它的两倍）
         "fold.budget" => Ok(Value::from(folding::BUDGET)),
         // {text} → 较早的回复正文的摘要
@@ -440,6 +509,14 @@ fn journal_of(params: &Params, body: impl FnOnce(&mut journal::Journal) -> Value
 
 fn to_value(value: impl serde::Serialize) -> Result<Value, ApiError> {
     serde_json::to_value(value).map_err(|error| ApiError { code: "internal", message: error.to_string() })
+}
+
+fn override_id(params: &Params) -> Option<u64> {
+    params.get("override").and_then(Value::as_u64)
+}
+
+fn merge_report(report: prompts::MergeReport) -> Value {
+    json!({ "installed": report.installed, "added": report.added, "updated": report.updated, "keptLocal": report.kept_local })
 }
 
 fn string_map(params: &Params, key: &str) -> Result<HashMap<String, String>, ApiError> {

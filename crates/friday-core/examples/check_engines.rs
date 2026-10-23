@@ -3,7 +3,9 @@ use serde_json::Value;
 
 fn main() {
     for path in std::env::args().skip(1) {
-        let Ok(Value::Array(original)) = serde_json::from_str::<Value>(&std::fs::read_to_string(&path).unwrap()) else { panic!("不是数组") };
+        let Ok(Value::Array(original)) = serde_json::from_str::<Value>(&std::fs::read_to_string(&path).unwrap()) else {
+            panic!("不是数组")
+        };
         let written = serde_json::to_value(friday_core::engines::load(std::path::Path::new(&path))).unwrap();
         let written = written.as_array().unwrap();
         println!("{path}：{} 个引擎，读出 {}", original.len(), written.len());
