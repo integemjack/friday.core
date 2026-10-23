@@ -4,11 +4,13 @@
 //! code：`unknownMethod`（没有这个方法）、`invalidParams`（参数不对）、`internal`（核心里出错，C 接口层兜住的 panic 也报这个）。
 //! 时间一律用 Unix 毫秒（`now` 不传 = 现在），时长一律用秒（浮点）。
 //!
-//! 方法按模块分组（`quota.*`、`tools.*`），每个方法的参数和结果写在下面各自的函数上。
+//! 方法按模块分组（`quota.*`、`tools.*`、`secrets.*`），每个方法的参数和结果写在下面各自的函数上。
 
 use serde_json::{Map, Value, json};
 
-use crate::{quota, tool_aliases};
+use std::collections::{HashMap, HashSet};
+
+use crate::{quota, secret_guard, tool_aliases};
 
 #[derive(Debug)]
 pub struct ApiError {
@@ -101,6 +103,54 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
             Ok(if canonical == arguments { Value::Null } else { Value::Object(canonical) })
         }
 
+        // {values: {名字: 值}, ignored: [哈希], released: {名字: 值}} → {"known": 参与全文匹配的个数}（密钥库每次变化时调）
+        "secrets.update" => {
+            let known = secret_guard::shared().update(
+                &string_map(params, "values")?,
+                string_list(params, "ignored")?.into_iter().collect::<HashSet<_>>(),
+                &string_map(params, "released")?,
+            );
+            Ok(json!({ "known": known }))
+        }
+        // {text, strongOnly?} → [{value, name, start, length, fromContext}]（start、length 按 UTF-16）
+        "secrets.detect" => {
+            let text = string(params, "text")?;
+            let strong = params.get("strongOnly").and_then(Value::as_bool).unwrap_or(false);
+            let candidates = secret_guard::shared().detect(&text, strong);
+            Ok(Value::from(
+                candidates
+                    .into_iter()
+                    .map(|candidate| {
+                        let start = secret_guard::utf16_offset(&text, candidate.start);
+                        json!({
+                            "value": candidate.value,
+                            "name": candidate.name,
+                            "start": start,
+                            "length": secret_guard::utf16_offset(&text, candidate.end) - start,
+                            "fromContext": candidate.from_context,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            ))
+        }
+        // {text} → 换过的文本
+        "secrets.mask" => Ok(Value::from(secret_guard::shared().mask(&string(params, "text")?))),
+        // {value} → 每个字符串都遮过的 value（发给在线模型之前）
+        "secrets.maskJSON" => Ok(secret_guard::shared().mask_json(params.get("value").cloned().unwrap_or(Value::Null))),
+        // {text} → 换过的 JSON 文本
+        "secrets.maskStored" => Ok(Value::from(secret_guard::shared().mask_stored(&string(params, "text")?))),
+        // {directory} → null（数据目录里的 conversations.json、learning.json、journal.json 原地换）
+        "secrets.scrubStoredFiles" => {
+            secret_guard::shared().scrub_stored_files(std::path::Path::new(&string(params, "directory")?));
+            Ok(Value::Null)
+        }
+        // {value} → 是不是用户说过「不是密钥」的
+        "secrets.isIgnored" => Ok(Value::from(secret_guard::shared().is_ignored(&string(params, "value")?))),
+        // {value} → SHA-256（小写十六进制）
+        "secrets.hash" => Ok(Value::from(secret_guard::hash(&string(params, "value")?))),
+        // {name} → 密钥名合不合法
+        "secrets.isValidName" => Ok(Value::from(secret_guard::is_valid_name(&string(params, "name")?))),
+
         _ => Err(ApiError { code: "unknownMethod", message: format!("没有这个方法：{method}") }),
     }
 }
@@ -110,6 +160,30 @@ fn string(params: &Params, key: &str) -> Result<String, ApiError> {
         None | Some(Value::Null) => Ok(String::new()),
         Some(Value::String(text)) => Ok(text.clone()),
         Some(_) => Err(ApiError::invalid(format!("{key} 要是字符串"))),
+    }
+}
+
+fn string_map(params: &Params, key: &str) -> Result<HashMap<String, String>, ApiError> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(HashMap::new()),
+        Some(Value::Object(object)) => object
+            .iter()
+            .map(|(name, value)| value.as_str().map(|text| (name.clone(), text.to_string())))
+            .collect::<Option<_>>()
+            .ok_or_else(|| ApiError::invalid(format!("{key} 的值要是字符串"))),
+        Some(_) => Err(ApiError::invalid(format!("{key} 要是对象"))),
+    }
+}
+
+fn string_list(params: &Params, key: &str) -> Result<Vec<String>, ApiError> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| item.as_str().map(str::to_string))
+            .collect::<Option<_>>()
+            .ok_or_else(|| ApiError::invalid(format!("{key} 里要是字符串"))),
+        Some(_) => Err(ApiError::invalid(format!("{key} 要是数组"))),
     }
 }
 
@@ -168,6 +242,19 @@ mod tests {
         assert_eq!(parsed("quota.probeDelay", r#"{"kind":"usage","attempt":2}"#)["result"], json!(1200.0));
         assert_eq!(parsed("quota.probeDelay", r#"{"kind":"x","attempt":2}"#)["error"]["code"], json!("invalidParams"));
         assert_eq!(parsed("quota.headerNames", "")["result"][0], json!("Retry-After"));
+    }
+
+    #[test]
+    fn secrets_methods() {
+        // 全局那一份：只用这个测试自己的名字，不和别的测试抢
+        let token = concat!("ghp_", "ApiApiApiApiApiApiApiApi0123456789ab");
+        let detected = parsed("secrets.detect", &json!({ "text": format!("😀 https://x:{token}@github.com") }).to_string());
+        assert_eq!(detected["result"][0]["name"], json!("GITHUB_TOKEN"));
+        assert_eq!(detected["result"][0]["start"], json!(13));
+        assert_eq!(detected["result"][0]["length"], json!(token.len()));
+        assert_eq!(parsed("secrets.isValidName", r#"{"name":"API_KEY"}"#)["result"], json!(true));
+        assert_eq!(parsed("secrets.hash", r#"{"value":"abc"}"#)["result"].as_str().map(str::len), Some(64));
+        assert_eq!(parsed("secrets.update", r#"{"values":{"A":1}}"#)["error"]["code"], json!("invalidParams"));
     }
 
     #[test]

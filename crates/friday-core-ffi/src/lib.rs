@@ -1,7 +1,7 @@
 //! friday-core 的 C 接口（头文件 include/friday_core.h，两边要一起改）。编成静态库链进 Swift 版和 Qt 版。
 //!
 //! 约定：字符串都是 UTF-8、以 NUL 结尾；`friday_core_call` 返回的字符串归调用方，用 `friday_core_free` 放掉。
-//! 任意线程都能调（核心里没有全局可变状态）。核心里的 panic 在这里兜住，变成 `{"error": {"code": "internal", …}}`，不会跨过 C 边界。
+//! 任意线程都能调（有状态的部分在核心里加锁）。核心里的 panic 在这里兜住，变成 `{"error": {"code": "internal", …}}`，不会跨过 C 边界。
 
 use std::ffi::{CStr, CString, c_char};
 use std::panic::{AssertUnwindSafe, catch_unwind};

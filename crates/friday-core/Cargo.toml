@@ -10,6 +10,8 @@ name = "friday_core"
 
 [dependencies]
 chrono.workspace = true
+fancy-regex.workspace = true
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
