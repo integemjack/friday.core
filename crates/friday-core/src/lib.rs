@@ -11,6 +11,7 @@ pub mod chat_request;
 pub mod chat_stream;
 pub mod context;
 pub mod conversations;
+pub mod delivery;
 pub mod engine_loop;
 pub mod engines;
 pub mod events;

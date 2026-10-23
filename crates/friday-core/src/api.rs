@@ -12,9 +12,9 @@ use std::collections::{HashMap, HashSet};
 
 use crate::chat_models::Conversation;
 use crate::{
-    agents, archive, chat_request, chat_stream, context, conversations, engine_loop, engines, events, file_changes, file_edit, file_search,
-    folding, gate, journal, line_diff, liveness, mcp_client, mcp_config, model_traits, prompt_history, prompt_store, prompts, quota,
-    repetition, secret_guard, secret_store, shell_rules, swift_json, tool_aliases, tool_defs, tool_files,
+    agents, archive, chat_request, chat_stream, context, conversations, delivery, engine_loop, engines, events, file_changes, file_edit,
+    file_search, folding, gate, journal, line_diff, liveness, mcp_client, mcp_config, model_traits, prompt_history, prompt_store, prompts,
+    quota, repetition, secret_guard, secret_store, shell_rules, swift_json, tool_aliases, tool_defs, tool_files,
 };
 
 #[derive(Debug)]
@@ -335,6 +335,65 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
         "agents.role" => {
             let text = |key: &str| params.get(key).and_then(Value::as_str).map(str::to_string);
             Ok(json!(agents::composed_role(text("definitionRole").as_deref(), text("role").as_deref(), override_id(params))))
+        }
+        // {text} → {asksForPlan, asksForPlanExplicitly, looksLikeTask, taskWantsAnalysis, looksLikePlan, looksLikeAnnouncement, handsBackFix}
+        //   （交付检查的「起疑」：用户的话 / 任务 / 回复各看要的那几项）
+        "delivery.classify" => {
+            let text = string(params, "text")?;
+            Ok(json!({
+                "asksForPlan": delivery::asks_for_plan(&text),
+                "asksForPlanExplicitly": delivery::asks_for_plan_explicitly(&text),
+                "looksLikeTask": delivery::looks_like_task(&text),
+                "taskWantsAnalysis": delivery::task_wants_analysis(&text),
+                "looksLikePlan": delivery::looks_like_plan(&text),
+                "looksLikeAnnouncement": delivery::looks_like_announcement(&text),
+                "handsBackFix": delivery::hands_back_fix(&text),
+            }))
+        }
+        // {blocks, permissions: {名字: readOnly|writeFiles|execute|network}} → 真正动手了没有
+        "delivery.didWork" => Ok(json!(delivery::did_work(&blocks_of(params)?, &string_map(params, "permissions")?))),
+        // {blocks} → 最后一个工具调用之后的文字
+        "delivery.finalReply" => Ok(json!(delivery::final_reply(&blocks_of(params)?))),
+        // {text} → 「未完成与风险」写的东西或 null
+        "delivery.unfinished" => Ok(json!(delivery::unfinished_items(&string(params, "text")?))),
+        // {stops, offNote, override?} → 主智能体交了方案又没动手时的提醒
+        "delivery.mainPrompt" => {
+            Ok(json!(delivery::main_prompt(&string(params, "stops")?, &string(params, "offNote")?, override_id(params))))
+        }
+        // {delegates, override?} → 发现了问题却交回给用户时的提醒
+        "delivery.fixPrompt" => Ok(json!(delivery::fix_prompt(flag(params, "delegates"), override_id(params)))),
+        // {said, override?} → 只说了一句下一步时的提醒
+        "delivery.announcePrompt" => Ok(json!(delivery::announce_prompt(&string(params, "said")?, override_id(params)))),
+        // {result, unverified, stillPlan, stops, offNote, override?} → 交给父级的结果后面附的验收提示或 null
+        "delivery.reviewHint" => Ok(json!(delivery::review_hint(
+            &string(params, "result")?,
+            &string_list(params, "unverified")?,
+            flag(params, "stillPlan"),
+            &string(params, "stops")?,
+            &string(params, "offNote")?,
+            override_id(params)
+        ))),
+        // {blocks, permissions, windows?} → 写了、写完之后没运行或读过的文件
+        "turnCheck.unverified" => {
+            let windows = params.get("windows").and_then(Value::as_bool).unwrap_or(cfg!(windows));
+            Ok(json!(delivery::unverified_writes(&blocks_of(params)?, &string_map(params, "permissions")?, windows)))
+        }
+        // {request} → 用户说了不用运行 / 测试
+        "turnCheck.declined" => Ok(json!(delivery::user_declined_verification(&string(params, "request")?))),
+        // {files, delegates, override?} → 写完没验证的提醒
+        "turnCheck.prompt" => {
+            Ok(json!(delivery::turn_prompt(&string_list(params, "files")?, flag(params, "delegates"), override_id(params))))
+        }
+        // {id, blocks} → 按 id 前缀找到的子智能体事件或 null
+        "agentLog.find" => {
+            let blocks = blocks_of(params)?;
+            Ok(delivery::find_log(&string(params, "id")?, &blocks).map(to_value).transpose()?.unwrap_or(Value::Null))
+        }
+        // {event} → 运行记录整理成的文字（不截断）
+        "agentLog.text" => {
+            let event: crate::chat_models::ToolEvent = serde_json::from_value(Value::Object(object(params, "event")?))
+                .map_err(|error| ApiError::invalid(format!("event 解不出来：{error}")))?;
+            Ok(json!(delivery::log_text(&event)))
         }
         // {stoppedBy?, message, partial?} → 被停掉 / 失败时卡片上、交给父级的说明
         "agents.endedText" => {
@@ -1502,6 +1561,10 @@ fn mcp_outcome(outcome: Result<Value, mcp_client::Failure>) -> Value {
         Err(failure) if failure.cancelled => json!({ "failure": failure.message, "cancelled": true }),
         Err(failure) => json!({ "failure": failure.message }),
     }
+}
+
+fn blocks_of(params: &Params) -> Result<Vec<crate::chat_models::MessageBlock>, ApiError> {
+    serde_json::from_value(Value::Array(list(params, "blocks")?)).map_err(|error| ApiError::invalid(format!("blocks 解不出来：{error}")))
 }
 
 fn conversations_of(params: &Params, key: &str) -> Result<Vec<Conversation>, ApiError> {
