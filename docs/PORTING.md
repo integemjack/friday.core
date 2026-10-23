@@ -25,7 +25,7 @@
 | 1 | 密钥识别与替换（认、遮、清理存档、名字合不合法；密钥库本身留在两端的 SecretStore） | `Secrets/SecretGuard.swift`；`secrets/SecretGuard.cpp` | 完成 |
 | 1 | 上下文折叠、会话折叠（摘要、子 Agent 会话的折叠、估算 token；主会话标折叠、调试用的预算开关留在两端） | `Agent/ContextFolding.swift`、`LLM/Engine/SessionFolding.swift`；`agent/ContextFolding.cpp`、`llm/engine/SessionFolding.cpp` | 完成 |
 | 1 | 密钥库：存储、收进库、执行时换回明文 | `Secrets/SecretStore.swift`；`secrets/SecretStore.cpp` | |
-| 1 | 等额度的文案和时间 | `Agent/QuotaWaiting.swift`；`agent/QuotaWaiting.cpp` | |
+| 1 | 等额度的文案和时间（等到什么时候、消息上那一行、时间和「还有多久」的写法；停下、换大脑、定时检查留在两端） | `Agent/QuotaWaiting.swift`；`agent/QuotaWaiting.cpp` | 完成 |
 | 2 | 数据模型和存档格式（会话、消息块、工具事件的 JSON 与两端完全一致） | `Models/`；`models/` | |
 | 2 | 提示词拼装、工具定义 | `Prompts/`、`Agent/ToolRegistry.swift`；`agent/` | |
 | 3 | 在线引擎：请求、流式解析、重试、限流排队 | `LLM/Engine/`；`llm/engine/` | |

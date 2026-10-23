@@ -80,15 +80,33 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
         "quota.bodyDelay" => Ok(seconds(quota::body_delay(&string(params, "body")?, now(params)?))),
         // {text} → 秒 | null
         "quota.duration" => Ok(seconds(quota::duration(&string(params, "text")?))),
-        // {kind: "usage" | "balance", attempt} → 秒
-        "quota.probeDelay" => {
-            let kind = match string(params, "kind")?.as_str() {
-                "usage" => quota::WaitKind::Usage,
-                "balance" => quota::WaitKind::Balance,
-                other => return Err(ApiError::invalid(format!("kind 不认识：{other}"))),
+        // {kind, resumeAt?, attempts, now?} → {kind, resumeAt, known, attempts}（resumeAt：服务端说的恢复时间，没说不传）
+        "quota.wait" => {
+            let resume_at = match params.get("resumeAt") {
+                None | Some(Value::Null) => None,
+                Some(_) => Some(time(params, "resumeAt")?),
             };
-            Ok(Value::from(quota::probe_delay(kind, int(params, "attempt")?)))
+            let wait = quota::wait_for(wait_kind(params)?, resume_at, int(params, "attempts")?, now(params)?);
+            Ok(json!({
+                "kind": if wait.kind == quota::WaitKind::Balance { "balance" } else { "usage" },
+                "resumeAt": wait.resume_at.timestamp_millis(),
+                "known": wait.known,
+                "attempts": wait.attempts,
+            }))
         }
+        // {kind, resumeAt, known, now?} → 消息上「在等额度」那一行
+        "quota.waitText" => {
+            let known = params.get("known").and_then(Value::as_bool).unwrap_or(false);
+            Ok(Value::from(quota::wait_text(wait_kind(params)?, time(params, "resumeAt")?, known, now(params)?)))
+        }
+        // {date, now?} → 「14:07」或「10月5日 14:07」（本机时区）
+        "quota.clockText" => Ok(Value::from(quota::clock_text(time(params, "date")?, now(params)?))),
+        // {seconds} → 「25 分钟」「3 小时 5 分」「2 天 4 小时」
+        "quota.remainingText" => Ok(Value::from(quota::remaining_text(
+            params.get("seconds").and_then(Value::as_f64).ok_or_else(|| ApiError::invalid("缺少 seconds"))?,
+        ))),
+        // {kind: "usage" | "balance", attempt} → 秒
+        "quota.probeDelay" => Ok(Value::from(quota::probe_delay(wait_kind(params)?, int(params, "attempt")?))),
 
         // {name} → 内置工具名（name 是别家的叫法时），否则原样
         "tools.canonicalName" => Ok(Value::from(tool_aliases::canonical_name(&string(params, "name")?))),
@@ -254,6 +272,23 @@ fn now(params: &Params) -> Result<chrono::DateTime<chrono::Utc>, ApiError> {
     }
 }
 
+fn wait_kind(params: &Params) -> Result<quota::WaitKind, ApiError> {
+    match string(params, "kind")?.as_str() {
+        "usage" => Ok(quota::WaitKind::Usage),
+        "balance" => Ok(quota::WaitKind::Balance),
+        other => Err(ApiError::invalid(format!("kind 不认识：{other}"))),
+    }
+}
+
+/// Unix 毫秒 → 时间
+fn time(params: &Params, key: &str) -> Result<chrono::DateTime<chrono::Utc>, ApiError> {
+    params
+        .get(key)
+        .and_then(Value::as_f64)
+        .and_then(|millis| quota::from_epoch_millis(millis.round() as i64))
+        .ok_or_else(|| ApiError::invalid(format!("{key} 要是 Unix 毫秒")))
+}
+
 fn seconds(value: Option<f64>) -> Value {
     value.map_or(Value::Null, Value::from)
 }
@@ -289,6 +324,13 @@ mod tests {
         assert_eq!(parsed("quota.probeDelay", r#"{"kind":"usage","attempt":2}"#)["result"], json!(1200.0));
         assert_eq!(parsed("quota.probeDelay", r#"{"kind":"x","attempt":2}"#)["error"]["code"], json!("invalidParams"));
         assert_eq!(parsed("quota.headerNames", "")["result"][0], json!("Retry-After"));
+        let wait = parsed("quota.wait", &json!({ "kind": "usage", "resumeAt": now + 3_600_000, "attempts": 1, "now": now }).to_string());
+        assert_eq!(wait["result"], json!({ "kind": "usage", "resumeAt": now + 3_630_000, "known": true, "attempts": 1 }));
+        let wait = parsed("quota.wait", &json!({ "kind": "balance", "attempts": 2, "now": now }).to_string());
+        assert_eq!(wait["result"]["resumeAt"], json!(now + 1_800_000));
+        assert_eq!(parsed("quota.remainingText", r#"{"seconds":3720}"#)["result"], json!("1 小时 2 分"));
+        let text = parsed("quota.waitText", &json!({ "kind": "balance", "resumeAt": now, "known": false, "now": now }).to_string());
+        assert_eq!(text["result"], json!("额度应该恢复了，马上接着做"));
     }
 
     #[test]

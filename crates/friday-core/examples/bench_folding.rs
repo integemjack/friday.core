@@ -15,7 +15,9 @@ fn main() {
         friday_core::api::call("fold.estimate", &params);
     }
     println!("历史 {} KB：fold.estimate 每次 {:?}", size / 1000, start.elapsed() / 10);
-    let params = json!({"history": entries, "folded": 0, "budget": 30_000, "taskStateTool": "update_task_state", "wholeTools": ["delegate_task"]}).to_string();
+    let params =
+        json!({"history": entries, "folded": 0, "budget": 30_000, "taskStateTool": "update_task_state", "wholeTools": ["delegate_task"]})
+            .to_string();
     let start = Instant::now();
     let response = friday_core::api::call("fold.session", &params);
     println!("fold.session（折叠并写回 {} KB）{:?}", response.len() / 1000, start.elapsed());

@@ -351,6 +351,71 @@ pub fn probe_delay(kind: WaitKind, attempt: i64) -> f64 {
     }
 }
 
+// MARK: - 等额度（两端的 AgentRunner 停下这一轮、到点接着做；这里是等到什么时候和消息上的文案）
+
+/// 这一次等到什么时候（== 两端的 QuotaWait）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Wait {
+    pub kind: WaitKind,
+    /// 下次自动接着做的时间
+    pub resume_at: DateTime<Utc>,
+    /// resume_at 是服务端说的恢复时间（否则是没说、按间隔定时试）
+    pub known: bool,
+    /// 第几次等（没说什么时候恢复时，再试的间隔按它拉长）
+    pub attempts: i64,
+}
+
+/// 服务端说了恢复时间（且在将来）就到点后再过 30 秒（两边的钟可能差一点）；没说、或说的时间已经过了，按间隔定时试
+pub fn wait_for(kind: WaitKind, resume_at: Option<DateTime<Utc>>, attempts: i64, now: DateTime<Utc>) -> Wait {
+    match resume_at {
+        Some(resume_at) if resume_at > now => Wait { kind, resume_at: resume_at + chrono::Duration::seconds(30), known: true, attempts },
+        _ => Wait {
+            kind,
+            resume_at: now + chrono::Duration::milliseconds((probe_delay(kind, attempts) * 1000.0).round() as i64),
+            known: false,
+            attempts,
+        },
+    }
+}
+
+/// 消息上「在等额度」那一行：在等什么、什么时候接着做、还有多久
+pub fn wait_text(kind: WaitKind, resume_at: DateTime<Utc>, known: bool, now: DateTime<Utc>) -> String {
+    let remaining = (resume_at - now).num_milliseconds() as f64 / 1000.0;
+    if remaining <= 0.0 {
+        return "额度应该恢复了，马上接着做".to_string();
+    }
+    let time = clock_text(resume_at, now);
+    let left = remaining_text(remaining);
+    match (kind, known) {
+        (WaitKind::Usage, true) => format!("额度用完了，预计 {time} 恢复（还有 {left}），到时自动接着做"),
+        (WaitKind::Usage, false) => format!("额度用完了，{time}（{left}后）再试一次，恢复了就自动接着做"),
+        (WaitKind::Balance, _) => format!("余额不足或欠费，充值后会自动接着做：{time}（{left}后）再试一次"),
+    }
+}
+
+/// 「14:07」；不是今天的带上日期「10月5日 14:07」（本机时区）
+pub fn clock_text(date: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let local = date.with_timezone(&Local);
+    if local.date_naive() == now.with_timezone(&Local).date_naive() {
+        local.format("%H:%M").to_string()
+    } else {
+        local.format("%-m月%-d日 %H:%M").to_string()
+    }
+}
+
+/// 还有多久：按分钟往上取整（至少 1 分钟）——「25 分钟」「3 小时 5 分」「2 天 4 小时」
+pub fn remaining_text(seconds: f64) -> String {
+    let minutes = ((seconds / 60.0).ceil() as i64).max(1);
+    if minutes < 60 {
+        return format!("{minutes} 分钟");
+    }
+    let (hours, rest) = (minutes / 60, minutes % 60);
+    if hours < 24 {
+        return if rest > 0 { format!("{hours} 小时 {rest} 分") } else { format!("{hours} 小时") };
+    }
+    if hours % 24 > 0 { format!("{} 天 {} 小时", hours / 24, hours % 24) } else { format!("{} 天", hours / 24) }
+}
+
 fn epoch_seconds(date: DateTime<Utc>) -> f64 {
     date.timestamp_millis() as f64 / 1000.0
 }
@@ -567,6 +632,42 @@ mod tests {
         assert_eq!(delay(&[], "please retry again in 3s"), Some(3.0));
         // Retry-After 是空白时看后面的
         assert_eq!(delay(&[("Retry-After", "  "), ("x-ratelimit-reset", "7")], ""), Some(7.0));
+    }
+
+    /// == Swift 自检 quotaPolicy 后半和 Qt TestRunner::quotaWaitTexts
+    #[test]
+    fn waits() {
+        let now = utc(2026, 10, 4, 6, 0, 0);
+        let known = wait_for(WaitKind::Usage, Some(now + chrono::Duration::seconds(3600)), 1, now);
+        assert!(known.known);
+        assert_eq!(known.resume_at, now + chrono::Duration::seconds(3630));
+        let unknown = wait_for(WaitKind::Balance, None, 2, now);
+        assert!(!unknown.known && unknown.attempts == 2);
+        assert_eq!(unknown.resume_at, now + chrono::Duration::seconds(1800));
+        // 说的恢复时间已经过了：按间隔
+        let past = wait_for(WaitKind::Usage, Some(now - chrono::Duration::seconds(10)), 3, now);
+        assert!(!past.known);
+        assert_eq!(past.resume_at, now + chrono::Duration::seconds(1800));
+
+        assert_eq!(remaining_text(30.0), "1 分钟");
+        assert_eq!(remaining_text(-5.0), "1 分钟");
+        assert_eq!(remaining_text(3_600.0), "1 小时");
+        assert_eq!(remaining_text(3_720.0), "1 小时 2 分");
+        assert_eq!(remaining_text(3_661.0), "1 小时 2 分");
+        assert_eq!(remaining_text(2.0 * 86_400.0 + 4.0 * 3_600.0), "2 天 4 小时");
+        assert_eq!(remaining_text(86_400.0), "1 天");
+
+        let later = now + chrono::Duration::seconds(3_720);
+        let text = wait_text(WaitKind::Usage, later, true, now);
+        assert!(text.starts_with("额度用完了，预计 ") && text.ends_with("恢复（还有 1 小时 2 分），到时自动接着做"), "{text}");
+        assert!(wait_text(WaitKind::Usage, later, false, now).ends_with("（1 小时 2 分后）再试一次，恢复了就自动接着做"));
+        assert!(wait_text(WaitKind::Balance, later, false, now).starts_with("余额不足或欠费，充值后会自动接着做："));
+        assert_eq!(wait_text(WaitKind::Balance, now, false, now), "额度应该恢复了，马上接着做");
+
+        assert_eq!(clock_text(now, now), now.with_timezone(&Local).format("%H:%M").to_string());
+        let other_day = now + chrono::Duration::days(3);
+        let local = other_day.with_timezone(&Local);
+        assert_eq!(clock_text(other_day, now), format!("{}月{}日 {}", local.format("%-m"), local.format("%-d"), local.format("%H:%M")));
     }
 
     #[test]
