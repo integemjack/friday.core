@@ -13,8 +13,8 @@ use std::collections::{HashMap, HashSet};
 use crate::chat_models::Conversation;
 use crate::{
     agents, archive, chat_request, chat_stream, context, conversations, engine_loop, engines, events, file_changes, file_edit, file_search,
-    folding, gate, journal, line_diff, mcp_client, mcp_config, model_traits, prompt_history, prompt_store, prompts, quota, repetition,
-    secret_guard, secret_store, shell_rules, swift_json, tool_aliases, tool_defs, tool_files,
+    folding, gate, journal, line_diff, liveness, mcp_client, mcp_config, model_traits, prompt_history, prompt_store, prompts, quota,
+    repetition, secret_guard, secret_store, shell_rules, swift_json, tool_aliases, tool_defs, tool_files,
 };
 
 #[derive(Debug)]
@@ -335,6 +335,60 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
         "agents.role" => {
             let text = |key: &str| params.get(key).and_then(Value::as_str).map(str::to_string);
             Ok(json!(agents::composed_role(text("definitionRole").as_deref(), text("role").as_deref(), override_id(params))))
+        }
+        // {stoppedBy?, message, partial?} → 被停掉 / 失败时卡片上、交给父级的说明
+        "agents.endedText" => {
+            let text = |key: &str| params.get(key).and_then(Value::as_str).map(str::to_string);
+            Ok(json!(liveness::ended_text(text("stoppedBy").as_deref(), &text("message").unwrap_or_default(), text("partial").as_deref())))
+        }
+        // {cardText} → 给父级的建议
+        "agents.advice" => Ok(json!(liveness::advice(&string(params, "cardText")?))),
+        // {seconds} → N 秒 / N 分 M 秒 / N 小时 M 分
+        "agents.duration" => Ok(json!(liveness::duration(params.get("seconds").and_then(Value::as_f64).unwrap_or(0.0)))),
+        // {now?, stallLimit, grace?, runs: [{id, name, deadline?, warned, generating, lastOutput?}]} → [{id, action: stop|warn, by?, text?, journal?}]
+        "agents.watchdog" => {
+            let number = |value: &Value, key: &str| value.get(key).and_then(Value::as_f64);
+            let runs: Vec<liveness::Watched> = list(params, "runs")?
+                .iter()
+                .map(|run| liveness::Watched {
+                    id: run.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
+                    name: run.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
+                    deadline: number(run, "deadline"),
+                    warned: run.get("warned").and_then(Value::as_bool).unwrap_or(false),
+                    generating: run.get("generating").and_then(Value::as_bool).unwrap_or(false),
+                    last_output: number(run, "lastOutput"),
+                })
+                .collect();
+            let stall = params.get("stallLimit").and_then(Value::as_f64).unwrap_or(300.0);
+            let grace = params.get("grace").and_then(Value::as_f64).unwrap_or(liveness::DEADLINE_GRACE);
+            Ok(json!(liveness::watchdog(now_ms(params), stall, grace, &runs)))
+        }
+        // {seconds?, inherited?, now?} → 下级的期限（Unix 毫秒）或 null
+        "agents.childDeadline" => Ok(json!(liveness::child_deadline(
+            params.get("seconds").and_then(Value::as_f64),
+            params.get("inherited").and_then(Value::as_f64),
+            now_ms(params)
+        ))),
+        // {name, arguments, depth, last?: {signature, count}} → {count, signature}（同样的调用连续第几次；轮询类工具是 0）
+        "agents.repeat" => {
+            let last = params.get("last").and_then(|last| Some((last.get("signature")?.as_str()?, last.get("count")?.as_i64()?)));
+            let depth = params.get("depth").and_then(Value::as_i64).unwrap_or(0);
+            let (count, signature) = liveness::repeat_count(&string(params, "name")?, &string(params, "arguments")?, depth, last);
+            Ok(json!({ "count": count, "signature": signature }))
+        }
+        // {text, reports} → 并进中途汇报的结果
+        "agents.withReports" => Ok(json!(liveness::with_reports(&string(params, "text")?, &string_list(params, "reports")?))),
+        // {id, blocks, finalText, directory} → 做到一半的结果（长的全文存进 directory）或 null
+        "agents.partial" => {
+            let blocks: Vec<crate::chat_models::MessageBlock> = serde_json::from_value(Value::Array(list(params, "blocks")?))
+                .map_err(|error| ApiError::invalid(format!("blocks 解不出来：{error}")))?;
+            let directory = std::path::PathBuf::from(string(params, "directory")?);
+            Ok(json!(liveness::partial_result(&string(params, "id")?, &blocks, &string(params, "finalText")?, &directory)))
+        }
+        // {text, id, directory} → 交给上级的正文（太长的存全文、只交开头结尾和路径）
+        "agents.clipResult" => {
+            let directory = std::path::PathBuf::from(string(params, "directory")?);
+            Ok(json!(liveness::clip_result(&string(params, "text")?, &string(params, "id")?, &directory)))
         }
         // {args} → {goal, steps: [{key, spec, after, check, arguments}]} | {failure}（run_workflow 的计划）
         "workflow.plan" => Ok(match agents::workflow_plan(&object(params, "args")?) {
@@ -1667,6 +1721,11 @@ fn int(params: &Params, key: &str) -> Result<i64, ApiError> {
             .ok_or_else(|| ApiError::invalid(format!("{key} 要是整数"))),
         _ => Err(ApiError::invalid(format!("缺少整数参数 {key}"))),
     }
+}
+
+/// now（Unix 毫秒），不传是现在
+fn now_ms(params: &Params) -> f64 {
+    params.get("now").and_then(Value::as_f64).unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as f64)
 }
 
 fn now(params: &Params) -> Result<chrono::DateTime<chrono::Utc>, ApiError> {
