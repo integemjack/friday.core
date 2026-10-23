@@ -48,7 +48,7 @@
 | 4 | MCP（起 server 进程、JSON-RPC、通知、重连；Swift 用 MCP SDK、Qt 自己写的客户端）：有状态、要事件回调 | `MCP/`；`mcp/` | |
 | 4 | 事件回调：核心推事件、请两端做事再等回话（`friday_core_set_event_handler`，ABI 2；见 ARCHITECTURE.md §2.3） | `Core/CoreEvents.swift`；`util/CoreBridge` | 完成 |
 | 4 | 会话存储（增删改、分叉、落盘防抖，界面观察的快照） | `Models/ConversationStore.swift`；`models/ConversationStore.cpp` | |
-| 4 | 引擎的对话循环（请求 → 流式 → 工具调用 → 续写、复读处理、收尾）：发 HTTP、跑工具经「请两端做事」 | `LLM/Engine/OpenAIChatEngine.swift` 的 run；`llm/engine/OpenAIChatEngine.cpp` | |
+| 4 | 引擎的对话循环（历史、收尾、按会话折叠、本地大模型压历史、超长重发、统计、复读处理、截断续写、工具结果和截图、说了没做的提醒） | `LLM/Engine/OpenAIChatEngine.swift` 的 run；`llm/engine/OpenAIChatEngine.cpp` | 完成（`loop.*` 句柄，两端只照着执行：发 HTTP、跑工具、问本机上限；参数不是合法 JSON 的工具调用历史里记 "{}"（Qt 原来的做法）） |
 | 4 | 智能体循环（AgentRunner：一轮的调度、审批、恢复、看门狗）、子智能体、工作流、团队调度 | `Agent/AgentRunner.swift`、`SubAgentRunner.swift`、`Workflow.swift`、`AgentTeamControl.swift`；`agent/` | |
 | 5 | 远程服务端（照 REMOTE.md） | Qt `remote/` | |
 

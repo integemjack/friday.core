@@ -11,9 +11,9 @@ use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    chat_request, chat_stream, context, conversations, engines, events, file_changes, file_edit, file_search, folding, gate, journal,
-    line_diff, mcp_config, model_traits, prompt_history, prompt_store, prompts, quota, repetition, secret_guard, secret_store, shell_rules,
-    swift_json, tool_aliases, tool_defs, tool_files,
+    chat_request, chat_stream, context, conversations, engine_loop, engines, events, file_changes, file_edit, file_search, folding, gate,
+    journal, line_diff, mcp_config, model_traits, prompt_history, prompt_store, prompts, quota, repetition, secret_guard, secret_store,
+    shell_rules, swift_json, tool_aliases, tool_defs, tool_files,
 };
 
 #[derive(Debug)]
@@ -975,6 +975,132 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
         "mcp.save" => Ok(Value::from(
             mcp_config::save(std::path::Path::new(&string(params, "path")?), &object(params, "servers")?).err().unwrap_or_default(),
         )),
+        // 一轮对话的循环（见 engine_loop.rs：两端执行，核心决定下一步；历史在核心里）
+        // {config: {engineID, model, baseURL, supportsVision, supportsTools, thinking, extraBody}, history?} → {loop}
+        "loop.open" => {
+            let config = object(params, "config")?;
+            let text = |key: &str| config.get(key).and_then(Value::as_str).unwrap_or("").to_string();
+            let flag = |key: &str| config.get(key).and_then(Value::as_bool).unwrap_or(false);
+            let config = engine_loop::Config {
+                engine_id: text("engineID"),
+                model: text("model"),
+                base_url: text("baseURL"),
+                supports_vision: flag("supportsVision"),
+                supports_tools: flag("supportsTools"),
+                thinking: text("thinking"),
+                extra_body: text("extraBody"),
+            };
+            Ok(json!({ "loop": engine_loop::open(config, list(params, "history")?) }))
+        }
+        // {loop} → null
+        "loop.close" => {
+            engine_loop::close(handle(params, "loop")?);
+            Ok(Value::Null)
+        }
+        // {loop} → 历史（OpenAI 格式，不含 system）
+        "loop.history" => loop_of(params, |engine| Value::Array(engine.history().to_vec())),
+        // {loop, history} → null（整段换掉）；{loop, messages} → null（接在后面）；{loop} → null（之前的不再折叠）
+        "loop.setHistory" => {
+            let history = list(params, "history")?;
+            loop_of(params, |engine| {
+                engine.set_history(history);
+                Value::Null
+            })
+        }
+        "loop.append" => {
+            let messages = list(params, "messages")?;
+            loop_of(params, |engine| {
+                engine.append(messages);
+                Value::Null
+            })
+        }
+        "loop.foldFromHere" => loop_of(params, |engine| {
+            engine.fold_from_here();
+            Value::Null
+        }),
+        // {loop, settings: {instructions, tools, temperature, enableThinking, reasoningEffort?, maxOutputTokens?, maxToolRounds,
+        //   continuesWhenTruncated, hasDispatch, folding?: {budget, echoesReasoning, taskStateTool, wholeTools}}, begin?} → null
+        //   （换上设置；begin：一轮开始，计数清零）
+        "loop.settings" => {
+            let settings = object(params, "settings")?;
+            let folding = match settings.get("folding") {
+                Some(Value::Object(folding)) => Some((
+                    folding.get("budget").and_then(Value::as_i64).unwrap_or(folding::BUDGET),
+                    folding.get("echoesReasoning").and_then(Value::as_bool).unwrap_or(false),
+                    special(folding)?,
+                )),
+                _ => None,
+            };
+            let settings = engine_loop::Settings {
+                instructions: settings.get("instructions").and_then(Value::as_str).unwrap_or("").to_string(),
+                tools: settings.get("tools").and_then(Value::as_array).cloned().unwrap_or_default(),
+                temperature: settings.get("temperature").and_then(Value::as_f64).unwrap_or(0.6),
+                enable_thinking: settings.get("enableThinking").and_then(Value::as_bool).unwrap_or(false),
+                reasoning_effort: settings.get("reasoningEffort").and_then(Value::as_str).map(str::to_string),
+                max_output_tokens: settings.get("maxOutputTokens").and_then(Value::as_i64),
+                max_tool_rounds: settings.get("maxToolRounds").and_then(Value::as_i64).unwrap_or(0),
+                continues_when_truncated: settings.get("continuesWhenTruncated").and_then(Value::as_bool).unwrap_or(true),
+                has_dispatch: settings.get("hasDispatch").and_then(Value::as_bool).unwrap_or(false),
+                folding,
+            };
+            let begin = flag(params, "begin");
+            loop_of(params, |engine| {
+                if begin {
+                    engine.begin(settings);
+                } else {
+                    engine.configure(settings);
+                }
+                Value::Null
+            })
+        }
+        // {loop, probed?: 上限 | null, override?} → {probe: true} | {includeTools, showReasoning, wrapUp, local, fitted}
+        //   （probe：本地大模型要先问上限，问完带上 probed 再调一次；probed 为 null 是问过了没问到）
+        "loop.prepare" => {
+            let probed = params.get("probed").map(Value::as_i64);
+            let override_id = override_id(params);
+            loop_of(params, |engine| engine.prepare(probed, override_id))
+        }
+        // {loop, includeTools, xFriday?} → 请求体（遮过密钥）
+        "loop.body" => {
+            let include = flag(params, "includeTools");
+            let x_friday = params.get("xFriday").filter(|value| !value.is_null()).cloned();
+            loop_of(params, |engine| engine.body(include, x_friday))
+        }
+        // {loop, promptTokens, contextTokens} → {retry, fitted?}（请求被说超长）
+        "loop.overflow" => {
+            let (prompt, context) = (int(params, "promptTokens")?, int(params, "contextTokens")?);
+            loop_of(params, |engine| engine.overflow(prompt, context))
+        }
+        // {loop} → 收尾请求失败时交给界面的那句话
+        "loop.wrapUpFailed" => loop_of(params, |engine| Value::from(engine.wrap_up_failed())),
+        // {loop, pass, started, finished, firstToken?, fallback} → 统计（时间是 Unix 毫秒；pass 是 stream.finish 的结果）
+        "loop.passDone" => {
+            let pass = engine_loop::pass_from(&object(params, "pass")?);
+            let (started, finished, fallback) = (int(params, "started")?, int(params, "finished")?, int(params, "fallback")?);
+            let first = optional_int(params, "firstToken");
+            loop_of(params, |engine| engine.pass_done(pass, started, finished, first, fallback))
+        }
+        // {loop, keepGoing, override?} → {next: finish | prepare | tools, calls?: [{id, name, arguments | null, rejected?}], repetition?, chunks?, extraDone?}
+        "loop.decide" => {
+            let keep_going = params.get("keepGoing").and_then(Value::as_bool).unwrap_or(true);
+            let override_id = override_id(params);
+            loop_of(params, |engine| engine.decide(keep_going, override_id))
+        }
+        // {loop, results: [{id, name, content}], images?, imageMessage?, interjection?, override?} → {next: prepare, repetition?}
+        "loop.toolResults" => {
+            let results: Vec<(String, String, String)> = list(params, "results")?
+                .iter()
+                .map(|item| {
+                    let field = |key: &str| item.get(key).and_then(Value::as_str).unwrap_or("").to_string();
+                    (field("id"), field("name"), field("content"))
+                })
+                .collect();
+            let images = params.get("images").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let image_message = params.get("imageMessage").filter(|value| value.is_object()).cloned();
+            let interjection = list(params, "interjection")?;
+            let override_id = override_id(params);
+            loop_of(params, |engine| engine.tool_results(results, images, image_message, interjection, override_id))
+        }
         // 提示词文件夹（见 prompt_store.rs；状态推 promptStore.state，段变了推 promptStore.promptsChanged）。
         // {git?: 路径 | null（给了就用，不给 = 在 git 的队列里请两端找：promptStore.findGit）, environment?: {名字: 值}, version} → 状态
         "promptStore.start" => {
@@ -1222,6 +1348,11 @@ fn given_git(params: &Params) -> Option<Option<String>> {
         Some(Value::String(git)) if !git.is_empty() => Some(Some(git.clone())),
         Some(_) => Some(None),
     }
+}
+
+fn loop_of(params: &Params, body: impl FnOnce(&mut engine_loop::Loop) -> Value) -> Result<Value, ApiError> {
+    let id = handle(params, "loop")?;
+    engine_loop::with(id, body).ok_or_else(|| ApiError::invalid(format!("没有这个对话循环：{id}（关掉了？）")))
 }
 
 fn stream_of(params: &Params, body: impl FnOnce(&mut chat_stream::Parser) -> Value) -> Result<Value, ApiError> {

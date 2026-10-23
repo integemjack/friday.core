@@ -15,6 +15,8 @@ pub const CONTENT_PERIOD: usize = 60;
 pub const CONTENT_COPIES: usize = 8;
 /// 流式时每多这么多字（UTF-16）看一次
 pub const CHECK_EVERY: usize = 64;
+/// 一次请求里截断复读后提醒重来的次数；再复读就收尾
+pub const MAX_RETRIES: i64 = 2;
 /// 和之前几步的正文相似度达到这么多算「说差不多的话」
 pub const SAME_SAYING: f64 = 0.6;
 /// 去掉空白标点后至少这么多字才比
