@@ -163,7 +163,7 @@ pub fn read(directory: &Path) -> Result<Value, String> {
     let manifest = normalize(&object).map_err(|problem| format!("provider.json 读不出来：{problem}"))?;
     let entry = file_name(language_of(&manifest));
     let code = std::fs::read_to_string(directory.join(entry)).map_err(|_| format!("缺少入口文件 {entry}"))?;
-    Ok(json!({ "manifest": manifest, "code": code, "directory": directory.to_string_lossy() }))
+    Ok(json!({ "manifest": manifest, "code": code, "directory": tool_files::slash(directory) }))
 }
 
 /// 全部包（按名字排）和读不出来的原因（「Providers/<名字>：…」）
@@ -230,7 +230,7 @@ pub fn save(root: &Path, manifest: &Map<String, Value>, code: &str) -> Result<Va
     tool_files::write_atomically(&entry, code.as_bytes())?;
     make_executable(&entry);
     tool_files::write_in_place(&directory.join("provider.json"), &encoded(&manifest))?;
-    Ok(json!({ "manifest": manifest, "code": code, "directory": directory.to_string_lossy() }))
+    Ok(json!({ "manifest": manifest, "code": code, "directory": tool_files::slash(&directory) }))
 }
 
 /// 只更新清单（自测结果），不产生新版本
@@ -320,7 +320,7 @@ pub fn install(root: &Path, folder: &Path, source_name: &str, builtins: &[String
     manifest.remove("lastTest");
     tool_files::write_in_place(&directory.join("provider.json"), &encoded(&manifest))?;
     Ok(
-        json!({ "package": { "manifest": manifest, "code": package["code"], "directory": directory.to_string_lossy() }, "replaced": existing.is_some() }),
+        json!({ "package": { "manifest": manifest, "code": package["code"], "directory": tool_files::slash(&directory) }, "replaced": existing.is_some() }),
     )
 }
 

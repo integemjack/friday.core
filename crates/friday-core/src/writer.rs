@@ -70,9 +70,22 @@ pub fn write_now(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("file");
     let temporary = path.with_file_name(format!(".{name}.friday-core-{}", std::process::id()));
     std::fs::write(&temporary, data)?;
-    std::fs::rename(&temporary, path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&temporary);
-    })
+    // Windows 上目标正被别的程序开着（后台的 git add 在读、杀毒软件在扫）时换名会被拒：等一会儿再试（一共约 1.6 秒）
+    let mut delay = 20;
+    for attempt in 0.. {
+        match std::fs::rename(&temporary, path) {
+            Ok(()) => return Ok(()),
+            Err(_) if cfg!(windows) && attempt < 7 => {
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+                delay = (delay * 2).min(500);
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&temporary);
+                return Err(error);
+            }
+        }
+    }
+    unreachable!()
 }
 
 #[cfg(test)]

@@ -92,7 +92,7 @@ fn language_of(manifest: &Map<String, Value>) -> &str {
 pub fn load(directory: &Path) -> Option<Value> {
     let manifest = read_manifest(directory)?;
     let code = std::fs::read_to_string(directory.join(file_name(language_of(&manifest)))).ok()?;
-    Some(json!({ "manifest": manifest, "code": code, "directory": directory.to_string_lossy() }))
+    Some(json!({ "manifest": manifest, "code": code, "directory": tool_files::slash(directory) }))
 }
 
 /// 全部工具（按名字排；以「.」开头的目录跳过）
@@ -146,7 +146,7 @@ pub fn save(root: &Path, manifest: &Map<String, Value>, code: &str) -> Result<Va
         })?;
     }
     tool_files::write_in_place(&directory.join("tool.json"), &encoded(&manifest))?;
-    Ok(json!({ "manifest": manifest, "code": code, "directory": directory.to_string_lossy() }))
+    Ok(json!({ "manifest": manifest, "code": code, "directory": tool_files::slash(&directory) }))
 }
 
 /// 只更新清单（启用状态、自测结果），不产生新版本
@@ -217,7 +217,7 @@ pub fn media_paths(stdout: &str, work_directory: &Path, home: &Path) -> Vec<Stri
         })
         .filter(|path| path.exists())
         // Windows 上统一写「/」（同 Qt 的 QDir::fromNativeSeparators）
-        .map(|path| if cfg!(windows) { path.to_string_lossy().replace('\\', "/") } else { path.to_string_lossy().into_owned() })
+        .map(|path| tool_files::slash(&path))
         .collect()
 }
 

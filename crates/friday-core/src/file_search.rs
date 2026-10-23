@@ -91,11 +91,11 @@ pub fn matches(expression: &Regex, glob: &str, relative_path: &str) -> bool {
 
 /// 给模型看的路径：在工作目录下写相对路径，否则写绝对路径
 pub fn display_path(path: &str, working_directory: &str) -> String {
-    let full = tool_files::standardized(Path::new(path)).to_string_lossy().into_owned();
+    let full = tool_files::slash(&tool_files::standardized(Path::new(path)));
     if working_directory.is_empty() {
         return full;
     }
-    let base = tool_files::standardized(Path::new(working_directory)).to_string_lossy().into_owned();
+    let base = tool_files::slash(&tool_files::standardized(Path::new(working_directory)));
     let (full_lower, base_lower) = (full.to_lowercase(), base.to_lowercase());
     if full_lower == base_lower {
         return ".".into();

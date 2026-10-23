@@ -149,7 +149,19 @@ fn parent_of(path: &Path) -> PathBuf {
 }
 
 fn display(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
+    slash(path)
+}
+
+/// 交给两端的路径：Windows 上也用「/」（== Qt 的 QDir / cleanPath；Path::join 在 Windows 上拼的是「\\」）
+pub fn slash(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if cfg!(windows) { text.replace('\\', "/") } else { text.into_owned() }
+}
+
+/// 给人看的完整路径：Windows 上用「\\」（== QDir::toNativeSeparators）
+fn native(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if cfg!(windows) { text.replace('/', "\\") } else { text.into_owned() }
 }
 
 fn is_permission(error: &io::Error) -> bool {
@@ -271,7 +283,7 @@ pub fn path_hint(path: &str, working_directory: &str, want_directory: bool) -> S
         }
         hints.push(format!(
             "最近一层在的上级目录 {} 里有：{}",
-            display(&ancestor),
+            native(&ancestor),
             if names.is_empty() { "（空的）".to_string() } else { names.join("、") }
         ));
     }
@@ -296,7 +308,7 @@ pub fn path_hint(path: &str, working_directory: &str, want_directory: bool) -> S
                 }
                 let child = directory.join(&item);
                 if item.to_lowercase() == name.to_lowercase() && is_directory == want_directory {
-                    found.push(display(&child));
+                    found.push(native(&child));
                 }
                 if is_directory && !link && depth < 5 && !SKIPPED.contains(&item.as_str()) && !item.starts_with("build") {
                     queue.push_back((child, depth + 1));

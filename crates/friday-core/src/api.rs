@@ -593,7 +593,7 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
         // {folder, sourceName} → {folder} | {failure}（解开的包里 provider.json 在哪一层）
         "providers.locate" => {
             Ok(match provider_store::locate(std::path::Path::new(&string(params, "folder")?), &string(params, "sourceName")?) {
-                Ok(folder) => json!({ "folder": folder.to_string_lossy() }),
+                Ok(folder) => json!({ "folder": tool_files::slash(&folder) }),
                 Err(failure) => json!({ "failure": failure }),
             })
         }
@@ -1550,7 +1550,7 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
         "prompts.bundledSource" => Ok(Value::from(prompts::bundled_source(&string(params, "key")?))),
         // {} → {directory, fileNames, problems, lastMerge}
         "prompts.state" => Ok(json!({
-            "directory": prompts::directory().map(|dir| dir.to_string_lossy().into_owned()),
+            "directory": prompts::directory().map(|dir| tool_files::slash(&dir)),
             "fileNames": prompts::file_names(),
             "problems": prompts::problems(),
             "lastMerge": merge_report(prompts::last_merge()),

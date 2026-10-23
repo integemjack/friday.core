@@ -88,7 +88,7 @@ fn version_json(version: &Version) -> Value {
 fn snapshot(store: &Store) -> Value {
     json!({
         "revision": store.revision,
-        "directory": store.directory.as_ref().map(|directory| directory.to_string_lossy().into_owned()),
+        "directory": store.directory.as_ref().map(|directory| crate::tool_files::slash(directory)),
         "gitAvailable": store.git.is_some(),
         "git": store.git,
         "history": store.history.iter().map(version_json).collect::<Vec<_>>(),

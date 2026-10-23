@@ -180,7 +180,7 @@ pub fn save_result(text: &str, id: &str, directory: &Path) -> Option<String> {
     }
     let path = directory.join(format!("{}.md", short_id(id)));
     std::fs::write(&path, text).ok()?;
-    Some(path.to_string_lossy().into_owned())
+    Some(crate::tool_files::slash(&path))
 }
 
 /// 交给上级的正文：不超过 RESULT_LIMIT 字原样返回；超过就存全文、交回开头 3/4 和结尾 1/4，中间写明全文在哪

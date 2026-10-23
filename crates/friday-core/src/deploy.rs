@@ -490,7 +490,7 @@ pub fn from_directory(directory: &Path, key: &str, server: bool, protocol: i64) 
         }
         let size = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
         best = Some((
-            json!({ "file": entry.path().to_string_lossy(), "name": name, "size": size, "version": version.version_string(), "protocolVersion": protocol,
+            json!({ "file": crate::tool_files::slash(&entry.path()), "name": name, "size": size, "version": version.version_string(), "protocolVersion": protocol,
                 "server": server }),
             version,
         ));
