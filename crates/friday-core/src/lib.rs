@@ -10,6 +10,7 @@ pub mod chat_stream;
 pub mod context;
 pub mod conversations;
 pub mod engines;
+pub mod events;
 pub mod file_changes;
 pub mod file_edit;
 pub mod file_search;
@@ -34,5 +35,5 @@ pub mod writer;
 /// 版本号（== Cargo.toml 的 workspace.package.version）
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// C 接口的版本：方法改了不兼容的参数或结果时加一（两端的包装按它检查链进来的库）
-pub const ABI_VERSION: u32 = 1;
+/// C 接口的版本：方法改了不兼容的参数或结果时加一（两端的包装按它检查链进来的库）。2：加了事件回调 friday_core_set_event_handler
+pub const ABI_VERSION: u32 = 2;

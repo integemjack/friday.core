@@ -11,8 +11,9 @@ use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    chat_request, chat_stream, context, conversations, engines, file_changes, file_edit, file_search, folding, gate, journal, line_diff,
-    model_traits, prompt_history, prompts, quota, repetition, secret_guard, secret_store, shell_rules, tool_aliases, tool_defs, tool_files,
+    chat_request, chat_stream, context, conversations, engines, events, file_changes, file_edit, file_search, folding, gate, journal,
+    line_diff, model_traits, prompt_history, prompts, quota, repetition, secret_guard, secret_store, shell_rules, tool_aliases, tool_defs,
+    tool_files,
 };
 
 #[derive(Debug)]
@@ -56,6 +57,39 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
     match method {
         // {} → {"version": "0.1.0", "abi": 1}
         "core.version" => Ok(json!({ "version": crate::VERSION, "abi": crate::ABI_VERSION })),
+        // {request, result? | error?} → 在等没有（两端做完核心请它做的事，回话；见 events.rs）
+        "core.reply" => {
+            let id = handle(params, "request")?;
+            let outcome = match params.get("error").and_then(Value::as_str) {
+                Some(error) => Err(error.to_string()),
+                None => Ok(params.get("result").cloned().unwrap_or(Value::Null)),
+            };
+            Ok(Value::from(events::reply(id, outcome)))
+        }
+        // {data?, delayMs?} → null（两端自检用：过 delayMs 毫秒在核心的线程上推一个 core.pong，data 原样带回）
+        "core.ping" => {
+            let data = params.get("data").cloned().unwrap_or(Value::Null);
+            let delay = params.get("delayMs").and_then(Value::as_u64).unwrap_or(0);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+                events::emit("core.pong", data);
+            });
+            Ok(Value::Null)
+        }
+        // {kind, data?, timeoutMs?} → null（两端自检用：在核心的线程上请两端做 kind，拿到的结果推成 core.testRequestDone {result | error}）
+        "core.testRequest" => {
+            let kind = string(params, "kind")?;
+            let data = params.get("data").cloned().unwrap_or(Value::Null);
+            let timeout = std::time::Duration::from_millis(params.get("timeoutMs").and_then(Value::as_u64).unwrap_or(5_000));
+            std::thread::spawn(move || {
+                let done = match events::request(&kind, data, Some(timeout)) {
+                    Ok(result) => json!({ "result": result }),
+                    Err(error) => json!({ "error": error }),
+                };
+                events::emit("core.testRequestDone", done);
+            });
+            Ok(Value::Null)
+        }
         // {} → null（等后台排着的写盘都写完；两端退出前调）
         "core.flush" => {
             crate::writer::flush();
