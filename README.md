@@ -34,3 +34,7 @@ ARCHS="arm64 x86_64" scripts/build_apple.sh   # 编 macOS 通用静态库到 tar
 ```
 
 本机（M1 iMac）的 Rust 装在外置盘：`~/.cargo`、`~/.rustup` 是指向 `/Volumes/9100 PRO/rust/` 的软链（系统盘空间不够）。
+
+## 许可证
+
+MIT 或 Apache-2.0 任选（[LICENSE-MIT](LICENSE-MIT)、[LICENSE-APACHE](LICENSE-APACHE)）。除非另有说明，提交进来的贡献按同样的双许可证授权。

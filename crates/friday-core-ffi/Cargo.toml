@@ -4,6 +4,8 @@ description = "friday-core 的 C 接口（include/friday_core.h），编成静�
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [lib]
 name = "fridaycore"

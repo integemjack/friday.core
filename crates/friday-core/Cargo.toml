@@ -4,6 +4,8 @@ description = "Friday 的核心逻辑：Swift 版和 Qt 版共用，经 friday-c
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [lib]
 name = "friday_core"
