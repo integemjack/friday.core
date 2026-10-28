@@ -290,8 +290,11 @@ mod tests {
         let written: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(written.as_array().unwrap().len(), 1);
         assert_eq!(written[0]["title"], "二改");
-        // 编码慢：间隔放大，最多 30 秒
-        assert_eq!(interval_of(id, 0.5), 15.0);
+        // 编码慢：间隔放大，最多 30 秒。save 取的是「交来的编码耗时」和「上次后台写盘量到的」大的那个：后台那次可能已经写完了，
+        // 量到的是 0.5 秒再加上序列化这几条的一点时间（慢机器上多出几十微秒），所以这里只要求不小于 15、没大出一截
+        assert_eq!(super::interval(0.5), 15.0);
+        let slow = interval_of(id, 0.5);
+        assert!((15.0..16.0).contains(&slow), "{slow}");
         assert_eq!(super::interval(5.0), 30.0);
         close(id);
         assert!(save(id, 3, Vec::new(), Vec::new(), 0.0).is_none());

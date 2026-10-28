@@ -288,7 +288,8 @@ mod tests {
         std::fs::create_dir_all(&work).unwrap();
         std::fs::write(work.join("a.png"), b"x").unwrap();
         let paths = media_paths("{\"images\": [\"a.png\", \"b.png\"], \"file\": 3}", &work, Path::new("/nonexistent"));
-        assert_eq!(paths, [work.join("a.png").to_string_lossy().into_owned()]);
+        // Windows 上交给两端的路径一律用「/」（tool_files::slash）
+        assert_eq!(paths, [tool_files::slash(&work.join("a.png"))]);
         assert!(media_paths("不是 JSON", &work, Path::new("/")).is_empty());
         let _ = std::fs::remove_dir_all(&work);
     }

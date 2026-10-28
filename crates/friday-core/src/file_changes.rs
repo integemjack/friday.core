@@ -502,10 +502,13 @@ mod tests {
         assert_eq!(resolve("~/x", "/base", "/home/me"), "/home/me/x");
         assert_eq!(resolve("x/../y", "/base", "/home/me"), "/base/y");
         let base = "/w";
-        assert_eq!(
-            mentioned_paths(r#"cp "a b.txt" c\ d.txt -o=out.txt --flag http://x *.rs $HOME; cat ./a.txt|wc"#, base, "/h"),
-            ["/w/cp", "/w/a b.txt", "/w/c d.txt", "/w/out.txt", "/w/cat", "/w/a.txt", "/w/wc"]
-        );
+        // Windows 上 \ 是路径分隔符、不是 shell 的转义：c\ d.txt 是两个词（见 mentioned_paths）
+        let expected: &[&str] = if cfg!(windows) {
+            &["/w/cp", "/w/a b.txt", "/w/c", "/w/d.txt", "/w/out.txt", "/w/cat", "/w/a.txt", "/w/wc"]
+        } else {
+            &["/w/cp", "/w/a b.txt", "/w/c d.txt", "/w/out.txt", "/w/cat", "/w/a.txt", "/w/wc"]
+        };
+        assert_eq!(mentioned_paths(r#"cp "a b.txt" c\ d.txt -o=out.txt --flag http://x *.rs $HOME; cat ./a.txt|wc"#, base, "/h"), expected);
         assert!(is_inside("/a/b", "/a") && is_inside("/a", "/a") && !is_inside("/ab", "/a"));
         assert!(too_wide("/", "/h") && too_wide("/h", "/h/") && !too_wide("/h/x", "/h"));
     }
