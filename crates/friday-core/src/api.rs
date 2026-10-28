@@ -1641,6 +1641,8 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
         }
         // {loop} → 历史（OpenAI 格式，不含 system）
         "loop.history" => loop_of(params, |engine| Value::Array(engine.history().to_vec())),
+        // v2.86 {loop} → 这个循环接上的消息（原样）
+        "loop.appended" => loop_of(params, |engine| Value::Array(engine.appended().to_vec())),
         // {loop, history} → null（整段换掉）；{loop, messages} → null（接在后面）；{loop} → null（之前的不再折叠）
         "loop.setHistory" => {
             let history = list(params, "history")?;
@@ -1684,6 +1686,9 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
                 continues_when_truncated: settings.get("continuesWhenTruncated").and_then(Value::as_bool).unwrap_or(true),
                 has_dispatch: settings.get("hasDispatch").and_then(Value::as_bool).unwrap_or(false),
                 folding,
+                // v2.86 已折叠步骤的上限（0 不限）、主智能体这一轮是第几轮（子智能体不给）
+                folded_budget: settings.get("foldedBudget").and_then(Value::as_i64).unwrap_or(0),
+                history_turn: settings.get("historyTurn").and_then(Value::as_i64),
             };
             let begin = flag(params, "begin");
             loop_of(params, |engine| {
@@ -1695,7 +1700,7 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
                 Value::Null
             })
         }
-        // {loop, probed?: 上限 | null, override?} → {probe: true} | {includeTools, showReasoning, wrapUp, local, fitted}
+        // {loop, probed?: 上限 | null, override?} → {probe: true} | {includeTools, showReasoning, wrapUp, local, fitted, folded, trimmed}
         //   （probe：本地大模型要先问上限，问完带上 probed 再调一次；probed 为 null 是问过了没问到）
         "loop.prepare" => {
             let probed = params.get("probed").map(Value::as_i64);

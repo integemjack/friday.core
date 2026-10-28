@@ -59,6 +59,10 @@ pub struct Settings {
     pub has_dispatch: bool,
     /// 按会话折叠较早的步骤（子智能体、主智能体这一轮自己的步骤）；None 不折
     pub folding: Option<(i64, bool, Special)>,
+    /// v2.86 已折叠的步骤最多留多少（估算 token；0 不限）：超过就把最早的整步去掉（folding::trim）
+    pub folded_budget: i64,
+    /// v2.86 主智能体这一轮是第几轮（去掉的步骤留的说明写「用 read_history 看第几轮」）；None 是子智能体（只说重新调用工具）
+    pub history_turn: Option<i64>,
 }
 
 /// 这一段请求的结果（两端读完流交过来的；== PassResult）
@@ -89,6 +93,11 @@ pub struct Loop {
     history: Vec<Value>,
     /// history 前多少条已经折叠过
     folded: usize,
+    /// v2.86 从哪条起归这次运行折（fold_from_here 记下）、这次运行一共去掉了几步已折叠的
+    fold_start: usize,
+    dropped: usize,
+    /// v2.86 这个循环接上的消息（原样，折叠、压缩都不动它）：存档存原样的两端（EDITH）拿它
+    appended: Vec<Value>,
     /// 上一段请求发出时的估算（本地大模型收到 prompt_tokens 后校准用）
     last_estimate: i64,
     // 这一轮的
@@ -106,6 +115,7 @@ pub struct Loop {
     awaiting_probe: bool,
     /// 问上限之前那次折叠的结果（问完再交给两端）
     folded_note: Value,
+    trimmed_note: Value,
     parts: Parts,
     pass: Option<Pass>,
 }
@@ -157,15 +167,31 @@ impl Loop {
     pub fn set_history(&mut self, history: Vec<Value>) {
         self.history = history;
         self.folded = self.folded.min(self.history.len());
+        self.fold_start = self.fold_start.min(self.folded);
     }
 
     pub fn append(&mut self, messages: Vec<Value>) {
-        self.history.extend(messages);
+        for message in messages {
+            self.push(message);
+        }
     }
 
-    /// 之前的历史都不再折叠（主智能体每轮开头）
+    /// v2.86 接一条消息：历史里的会被折叠、压缩，appended 里的是原样
+    fn push(&mut self, message: Value) {
+        self.appended.push(message.clone());
+        self.history.push(message);
+    }
+
+    /// v2.86 这个循环接上的消息（原样）
+    pub fn appended(&self) -> &[Value] {
+        &self.appended
+    }
+
+    /// 之前的历史都不再折叠（主智能体每轮开头）；v2.86 去掉已折叠步骤（folding::trim）也从这里算起
     pub fn fold_from_here(&mut self) {
         self.folded = self.folded.max(self.history.len());
+        self.fold_start = self.folded;
+        self.dropped = 0;
     }
 
     /// 只换设置（不动这一轮的计数；两端改了引擎上的属性、单独取请求体时用）
@@ -223,7 +249,9 @@ impl Loop {
             return None;
         }
         let summaries = self.summaries();
-        let result = context::compact(&mut self.history, &mut self.folded, budget, summaries.as_ref());
+        let mut marks = [self.folded, self.fold_start];
+        let result = context::compact_marks(&mut self.history, &mut marks, budget, summaries.as_ref());
+        [self.folded, self.fold_start] = marks;
         (result.shortened > 0 || result.dropped > 0).then_some((result, limit))
     }
 
@@ -244,7 +272,7 @@ impl Loop {
             self.wrap_up = self.settings.max_tool_rounds > 0 && self.passes > self.settings.max_tool_rounds;
             if self.wrap_up {
                 let prompt = text("wrap-up", &[("rounds", self.settings.max_tool_rounds.to_string())], override_id);
-                self.history.push(user(prompt));
+                self.push(user(prompt));
             }
             if let Some((budget, echoes, special)) = &self.settings.folding {
                 let special = Special { task_state: special.task_state.clone(), whole: special.whole.clone() };
@@ -253,6 +281,27 @@ impl Loop {
                     folded = json!({ "steps": applied.steps, "before": applied.before, "after": applied.after });
                 }
                 self.folded_note = folded.clone();
+                // v2.86 折叠过的步骤也有上限：最早的整步去掉
+                let turn = self.settings.history_turn;
+                let note = move |count: usize| match turn {
+                    Some(turn) => {
+                        text("context-fold.dropped-steps", &[("count", count.to_string()), ("turn", turn.to_string())], override_id)
+                    }
+                    None => text("context-fold.dropped-steps.sub", &[("count", count.to_string())], override_id),
+                };
+                let trimmed = folding::trim(
+                    &mut self.history,
+                    self.fold_start,
+                    &mut self.folded,
+                    &mut self.dropped,
+                    self.settings.folded_budget,
+                    &note,
+                );
+                self.trimmed_note = if trimmed.steps > 0 {
+                    json!({ "steps": trimmed.steps, "total": trimmed.total, "after": trimmed.after })
+                } else {
+                    Value::Null
+                };
             }
             self.local = self.is_local();
             if self.local && probed.is_none() && self.wants_probe() {
@@ -265,21 +314,23 @@ impl Loop {
             folded = std::mem::take(&mut self.folded_note);
         }
         self.folded_note = Value::Null;
-        if self.local {
-            let key = self.context_key();
-            if let Some(Some(limit)) = probed {
-                context::remember_limit(&key, limit);
-            }
-            if let Some((result, limit)) = self.fit(false, context::known_limit(&key)) {
-                fitted = compacted_json(&result, limit, context::ratio(&key));
-            }
+        let trimmed = std::mem::take(&mut self.trimmed_note);
+        let key = self.context_key();
+        if self.local
+            && let Some(Some(limit)) = probed
+        {
+            context::remember_limit(&key, limit);
+        }
+        // v2.11 本地大模型、v2.86 起知道上限的在线模型（超长报错里记的、服务商报的；设置里猜的不算）：按上限先压历史
+        let limit = context::known_limit(&key)
+            .or_else(|| (!self.local).then(|| context::provider_limit(&self.config.base_url, &self.config.model)).flatten());
+        if let Some((result, limit)) = self.fit(false, limit) {
+            fitted = compacted_json(&result, limit, context::ratio(&key));
         }
         // 这次请求的各部分（按字数估算，回来后按实际的 prompt_tokens 缩放）
         let tool_bytes = if self.wrap_up { 0 } else { self.tool_bytes() };
         self.parts = Parts::estimate(&self.settings.instructions, tool_bytes, &self.history);
-        if self.local {
-            self.last_estimate = self.request_estimate();
-        }
+        self.last_estimate = self.request_estimate();
         self.refitted = false;
         json!({
             "includeTools": !self.wrap_up,
@@ -288,6 +339,7 @@ impl Loop {
             "local": self.local,
             "fitted": fitted,
             "folded": folded,
+            "trimmed": trimmed,
         })
     }
 
@@ -312,36 +364,44 @@ impl Loop {
         chat_request::masked(chat_request::request_body(&options))
     }
 
-    /// 请求被说超长：记下报错里的上限（和实际长度，校准估算）；本地大模型压完重发一次。返回要不要重发、压了什么
+    /// 请求被说超长：记下报错里的上限（和实际长度，校准估算），压完重发一次（v2.86 起在线模型也这样，以前在线模型直接失败）。
+    /// 上限：报错里的、记下的，在线模型再看服务商报的；都没有就把这次请求的估算当成上限的 1.25 倍压（压掉约一半）、不记下来，
+    /// 结果里的 limit 给 0（两端提示里不写数）。返回要不要重发、压了什么
     pub fn overflow(&mut self, prompt_tokens: i64, context_tokens: i64) -> Value {
         let key = self.context_key();
         if context_tokens > 0 {
-            // 在线模型报的上限也记下（只给上下文进度环用）
             context::remember_limit(&key, context_tokens);
         }
-        if !self.local || self.refitted || context_tokens <= 0 {
+        if self.refitted {
             return json!({ "retry": false });
         }
         if prompt_tokens > 0 && self.last_estimate > 0 {
             context::remember_ratio(&key, prompt_tokens as f64 / self.last_estimate as f64);
         }
-        let Some((result, limit)) = self.fit(true, Some(context_tokens)) else { return json!({ "retry": false }) };
+        let known = context::known_limit(&key)
+            .or_else(|| (!self.local).then(|| context::provider_limit(&self.config.base_url, &self.config.model)).flatten());
+        let limit = known.unwrap_or_else(|| (self.request_estimate() as f64 * context::ratio(&key) * 0.8) as i64);
+        if limit <= 0 {
+            return json!({ "retry": false });
+        }
+        let Some((result, limit)) = self.fit(true, Some(limit)) else { return json!({ "retry": false }) };
         self.last_estimate = self.request_estimate();
         self.refitted = true;
-        json!({ "retry": true, "fitted": compacted_json(&result, limit, context::ratio(&key)) })
+        json!({ "retry": true, "fitted": compacted_json(&result, if known.is_some() { limit } else { 0 }, context::ratio(&key)) })
     }
 
     /// 收尾请求本身失败（个别接口不接受「历史里有工具调用但请求不带 tools」）：给一句固定说明，不让整轮报错
     pub fn wrap_up_failed(&mut self) -> String {
         let text = format!("（已连续调用工具 {} 轮，达到本轮上限，先停在这里；接着做请回复「继续」。）", self.settings.max_tool_rounds);
-        self.history.push(json!({ "role": "assistant", "content": text }));
+        self.push(json!({ "role": "assistant", "content": text }));
         text
     }
 
     /// 一段请求读完：算统计（和上下文进度环），记下结果等 decide。时间都是 Unix 毫秒；fallback：设置里的最大上下文长度
     pub fn pass_done(&mut self, pass: Pass, started: i64, finished: i64, first_token: Option<i64>, fallback: i64) -> Value {
         let key = self.context_key();
-        if self.local && pass.prompt_tokens > 0 && self.last_estimate > 0 {
+        // v2.86 起在线模型也校准
+        if pass.prompt_tokens > 0 && self.last_estimate > 0 {
             context::remember_ratio(&key, pass.prompt_tokens as f64 / self.last_estimate as f64);
         }
         let mut generated = pass.completion_tokens;
@@ -363,7 +423,8 @@ impl Loop {
         let mut used = self.parts.scaled(if pass.prompt_tokens > 0 { pass.prompt_tokens } else { self.parts.total() });
         used.replies += generated;
         let (limit, guessed) = context::limit(&self.config.engine_id, &self.config.base_url, &self.config.model, fallback);
-        let compact_at = (self.local && !guessed).then(|| context::threshold(limit));
+        // 自动压缩的线：v2.86 起在线模型知道上限时也有
+        let compact_at = (!guessed).then(|| context::threshold(limit));
         self.pass = Some(pass.clone());
         json!({
             "promptTokens": pass.prompt_tokens,
@@ -391,7 +452,7 @@ impl Loop {
             if !pass.reasoning.is_empty() {
                 assistant["reasoning_content"] = json!(pass.reasoning);
             }
-            self.history.push(assistant);
+            self.push(assistant);
             let kind = if in_reasoning { "思考" } else { "回复" };
             let sample = prefix(&simplified(&unit), 40);
             let repetition = json!({ "kind": kind, "sample": sample, "times": self.loops + 1 });
@@ -400,13 +461,13 @@ impl Loop {
             }
             if self.loops >= repetition::MAX_RETRIES {
                 let gave_up = format!("\n\n{}", text("repetition.gave-up", &[], override_id));
-                self.history.push(json!({ "role": "assistant", "content": gave_up.trim() }));
+                self.push(json!({ "role": "assistant", "content": gave_up.trim() }));
                 return json!({ "next": "finish", "repetition": repetition, "chunks": [gave_up], "extraDone": true });
             }
             self.loops += 1;
             self.auto_continues = 0;
             self.continuing = false;
-            self.history.push(user(text("repetition.loop", &[("kind", kind.to_string()), ("sample", sample)], override_id)));
+            self.push(user(text("repetition.loop", &[("kind", kind.to_string()), ("sample", sample)], override_id)));
             return json!({ "next": "prepare", "repetition": repetition });
         }
         let mut assistant = json!({ "role": "assistant", "content": pass.content });
@@ -414,7 +475,7 @@ impl Loop {
             if !pass.reasoning.is_empty() {
                 assistant["reasoning_content"] = json!(pass.reasoning);
             }
-            self.history.push(assistant);
+            self.push(assistant);
             // 没说完就被长度上限截断：自动接着写
             if pass.truncated()
                 && !self.wrap_up
@@ -425,7 +486,7 @@ impl Loop {
                 self.auto_continues += 1;
                 self.continuing = true;
                 let key = if pass.content.is_empty() { "continue.reasoning" } else { "continue.output" };
-                self.history.push(user(text(key, &[], override_id)));
+                self.push(user(text(key, &[], override_id)));
                 return json!({ "next": "prepare" });
             }
             return json!({ "next": "finish" });
@@ -460,7 +521,7 @@ impl Loop {
         if !pass.reasoning.is_empty() {
             assistant["reasoning_content"] = json!(pass.reasoning);
         }
-        self.history.push(assistant);
+        self.push(assistant);
         self.pass = Some(Pass { tool_calls: Vec::new(), ..pass });
         json!({ "next": "tools", "calls": calls })
     }
@@ -476,7 +537,7 @@ impl Loop {
         override_id: Option<u64>,
     ) -> Value {
         for (id, name, content) in results {
-            self.history.push(json!({ "role": "tool", "tool_call_id": id, "name": name, "content": content }));
+            self.push(json!({ "role": "tool", "tool_call_id": id, "name": name, "content": content }));
         }
         if images > 0
             && self.config.supports_vision
@@ -498,19 +559,17 @@ impl Loop {
                 }
                 self.history[index] = user(format!("{IMAGE_MARKER}（较早的截图，已省略）"));
             }
-            self.history.push(message);
+            self.push(message);
         }
-        self.history.extend(interjection);
+        for message in interjection {
+            self.push(message);
+        }
         let content = self.pass.take().map(|pass| pass.content).unwrap_or_default();
         let similar = repetition::similar_count(&content, &self.sayings);
         self.sayings.push(content.clone());
         if similar >= 2 && (similar - 2).is_multiple_of(3) {
             let said = prefix(&simplified(&content), 60);
-            self.history.push(user(text(
-                "repetition.saying",
-                &[("times", (similar + 1).to_string()), ("said", said.clone())],
-                override_id,
-            )));
+            self.push(user(text("repetition.saying", &[("times", (similar + 1).to_string()), ("said", said.clone())], override_id)));
             return json!({ "next": "prepare", "repetition": { "kind": "说了没做", "sample": said, "times": similar + 1 } });
         }
         json!({ "next": "prepare" })
@@ -586,7 +645,9 @@ mod tests {
     fn prompts_installed() -> std::sync::MutexGuard<'static, ()> {
         let lock = prompts::TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let text = "@@ wrap-up\n到 {{rounds}} 轮了，收尾\n\n@@ continue.output\n接着写\n\n@@ continue.reasoning\n接着想\n\n@@ repetition.loop\n别在{{kind}}里复读：{{sample}}\n\n\
-                    @@ repetition.gave-up\n放弃了\n\n@@ repetition.saying\n第 {{times}} 次：{{said}}\n\n@@ rejected.truncated\n截断了\n\n@@ rejected.invalid\n参数不对：{{arguments}}\n";
+                    @@ repetition.gave-up\n放弃了\n\n@@ repetition.saying\n第 {{times}} 次：{{said}}\n\n@@ rejected.truncated\n截断了\n\n@@ rejected.invalid\n参数不对：{{arguments}}\n\n\
+                    @@ context-fit.omitted\n省略了 {{count}} 条\n\n@@ context-fold.dropped-steps\n第 {{turn}} 轮较早的 {{count}} 步已省略\n\n\
+                    @@ context-fold.dropped-steps.sub\n较早的 {{count}} 步已省略\n";
         prompts::setup(std::iter::once(("prompts-framework.md".to_string(), text.to_string())).collect(), None, Vec::new());
         lock
     }
@@ -719,5 +780,111 @@ mod tests {
         let shots: Vec<&Value> = engine.history().iter().filter(|entry| entry["role"] == "user" && entry["content"].is_array()).collect();
         assert_eq!(shots.len(), 2);
         assert!(engine.history().iter().any(|entry| entry["content"] == json!(format!("{IMAGE_MARKER}（较早的截图，已省略）"))));
+    }
+
+    fn special() -> Special {
+        Special { task_state: "update_task_state".into(), whole: vec!["delegate_task".into()] }
+    }
+
+    /// v2.86 在线模型：不知道上限、被说超长（报错里写了上限）就记下、压完重发一次；之后知道上限，发之前就压；
+    /// 报错里没写上限按这次请求估的压掉约一半、不记；压过还超长不再重发（== Swift SelfTests.contextFitEngine ④⑤⑥）
+    #[test]
+    fn online_overflow() {
+        let _prompts = prompts_installed();
+        let history: Vec<Value> =
+            (1..=6).flat_map(|n| [user(format!("第 {n} 件事")), json!({ "role": "assistant", "content": "z".repeat(4_000) })]).collect();
+        let online = |id: &str| Config { engine_id: id.into(), model: "online-model".into(), ..config() };
+        let mut engine = Loop::new(online("online-1"), history.clone());
+        engine.begin(settings());
+        engine.append(vec![user("第 7 件事".into())]);
+        let prepared = engine.prepare(None, None);
+        assert_eq!(prepared["fitted"], Value::Null, "不知道上限：不压");
+        let before = folding::estimated_tokens(engine.history());
+        let overflow = engine.overflow(9_000, 4_096);
+        assert_eq!(overflow["retry"], true);
+        assert_eq!(overflow["fitted"]["limit"], 4_096);
+        assert!(folding::estimated_tokens(engine.history()) < before / 2);
+        assert_eq!(engine.history().last().unwrap()["content"], "第 7 件事", "最后一条用户消息不动");
+        assert_eq!(context::known_limit("online-1|online-model"), Some(4_096));
+        assert!(context::ratio("online-1|online-model") > 1.0, "按报错里的实际长度校准");
+        assert_eq!(engine.overflow(9_000, 4_096)["retry"], false, "压过还超长：不再重发");
+        // 知道上限了：发之前就压
+        let mut again = Loop::new(online("online-1"), history.clone());
+        again.begin(settings());
+        again.append(vec![user("第 7 件事".into())]);
+        let prepared = again.prepare(None, None);
+        assert_eq!(prepared["fitted"]["limit"], 4_096);
+        // 报错里没写上限：压掉约一半，不记上限，limit 给 0
+        let mut vague = Loop::new(online("online-2"), history.clone());
+        vague.begin(settings());
+        vague.append(vec![user("第 7 件事".into())]);
+        vague.prepare(None, None);
+        let before = folding::estimated_tokens(vague.history());
+        let overflow = vague.overflow(0, 0);
+        assert_eq!((overflow["retry"].clone(), overflow["fitted"]["limit"].clone()), (json!(true), json!(0)));
+        assert!(folding::estimated_tokens(vague.history()) < before * 2 / 3);
+        assert_eq!(context::known_limit("online-2|online-model"), None);
+        // 进度环：知道上限的在线模型也有自动压缩的线
+        let stats = again.pass_done(pass("好"), 0, 10, None, 1_000_000);
+        assert_eq!(stats["contextLimit"], json!({ "tokens": 4_096, "guessed": false }));
+        assert_eq!(stats["contextCompactAt"], context::threshold(4_096));
+    }
+
+    /// v2.86 一轮里折过的步骤也有上限：最早的整步去掉、说明写第几轮；appended 里是原样（== Swift SelfTests.sessionTrim 的引擎那一半）
+    #[test]
+    fn trims_folded_steps() {
+        let _prompts = prompts_installed();
+        let earlier = vec![user("上一轮".into()), json!({ "role": "assistant", "content": "好" })];
+        let mut engine = Loop::new(config(), earlier);
+        engine.begin(Settings { folding: Some((4_000, false, special())), folded_budget: 1_500, history_turn: Some(7), ..settings() });
+        engine.fold_from_here();
+        engine.append(vec![user("这一轮的任务".into())]);
+        let mut trimmed = 0;
+        for step in 0..14 {
+            let prepared = engine.prepare(None, None);
+            if prepared["trimmed"].is_object() {
+                trimmed += 1;
+            }
+            let id = format!("c{step}");
+            engine.pass_done(
+                Pass { tool_calls: vec![(id.clone(), "run_shell".into(), "{}".into())], ..pass(&format!("第 {step} 步")) },
+                0,
+                10,
+                None,
+                100,
+            );
+            assert_eq!(engine.decide(true, None)["next"], "tools");
+            engine.tool_results(vec![(id, "run_shell".into(), "出".repeat(2_000))], 0, None, Vec::new(), None);
+        }
+        assert!(trimmed > 0, "去掉过");
+        let history = engine.history();
+        assert_eq!(history[..2], [user("上一轮".into()), json!({ "role": "assistant", "content": "好" })], "之前几轮不动");
+        assert_eq!(history[2]["content"], "这一轮的任务");
+        let carrier = history.iter().find(|entry| entry["content"].as_str().is_some_and(|text| text.starts_with("第 7 轮较早的"))).unwrap();
+        assert_eq!(carrier["role"], "assistant");
+        assert_eq!(history.last().unwrap()["content"].as_str().unwrap().chars().count(), 2_000, "最新的一步不动");
+        // appended：这个循环接上的全部原样
+        let appended = engine.appended();
+        assert_eq!(appended.len(), 1 + 14 * 2);
+        assert_eq!(appended[0]["content"], "这一轮的任务");
+        assert!(
+            appended
+                .iter()
+                .filter(|entry| entry["role"] == "tool")
+                .all(|entry| entry["content"].as_str().unwrap().chars().count() == 2_000)
+        );
+        assert!(appended.iter().all(|entry| !entry["content"].as_str().unwrap_or("").contains("已省略")));
+        // 子智能体（没给第几轮）：说明只说重新调用工具
+        let mut sub = Loop::new(config(), Vec::new());
+        sub.begin(Settings { folding: Some((4_000, false, special())), folded_budget: 1_500, ..settings() });
+        sub.append(vec![user("任务".into())]);
+        for step in 0..14 {
+            sub.prepare(None, None);
+            let id = format!("s{step}");
+            sub.pass_done(Pass { tool_calls: vec![(id.clone(), "run_shell".into(), "{}".into())], ..pass("看") }, 0, 10, None, 100);
+            sub.decide(true, None);
+            sub.tool_results(vec![(id, "run_shell".into(), "出".repeat(2_000))], 0, None, Vec::new(), None);
+        }
+        assert!(sub.history().iter().any(|entry| entry["content"].as_str().is_some_and(|text| text.starts_with("较早的 "))));
     }
 }

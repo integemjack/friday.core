@@ -68,6 +68,14 @@ fn role(entry: &Value) -> &str {
 
 /// 把 history 压到 budget（估算 token）以内；压不到也尽量压。folded：调用方记的「前多少条已经折叠过」，去掉前面的消息时跟着挪
 pub fn compact(history: &mut Vec<Value>, folded: &mut usize, budget: i64, summaries: Option<&Summaries>) -> Compacted {
+    let mut marks = [*folded];
+    let result = compact_marks(history, &mut marks, budget, summaries);
+    *folded = marks[0];
+    result
+}
+
+/// 同 [`compact`]；marks：调用方记的几个位置（前多少条已经折叠过、v2.86 这一轮从哪条起……），去掉前面的消息时一起挪（== Swift / Qt 的 marks）
+pub fn compact_marks(history: &mut Vec<Value>, marks: &mut [usize], budget: i64, summaries: Option<&Summaries>) -> Compacted {
     let mut result = Compacted { before: folding::estimated_tokens(history), ..Compacted::default() };
     let mut total = result.before;
     let count = history.len();
@@ -111,11 +119,13 @@ pub fn compact(history: &mut Vec<Value>, folded: &mut usize, budget: i64, summar
         // 去掉的每一段连续的地方留一句说明：前面留下的是用户消息就接在它后面，后面是用户消息就放在它前面，
         // 都不是才单独插一条用户消息（有的聊天模板不认连着两条用户消息）
         let mut rebuilt: Vec<Value> = Vec::new();
-        let mut new_folded = None;
+        let mut new_marks: Vec<Option<usize>> = vec![None; marks.len()];
         index = 0;
         while index < count {
-            if index >= *folded && new_folded.is_none() {
-                new_folded = Some(rebuilt.len());
+            for (mark, new) in marks.iter().zip(new_marks.iter_mut()) {
+                if index >= *mark && new.is_none() {
+                    *new = Some(rebuilt.len());
+                }
             }
             if !drop[index] {
                 rebuilt.push(history[index].clone());
@@ -136,7 +146,9 @@ pub fn compact(history: &mut Vec<Value>, folded: &mut usize, budget: i64, summar
             }
             index = end;
         }
-        *folded = new_folded.unwrap_or(rebuilt.len());
+        for (mark, new) in marks.iter_mut().zip(new_marks) {
+            *mark = new.unwrap_or(rebuilt.len());
+        }
         *history = rebuilt;
     }
     result.after = folding::estimated_tokens(history);
@@ -586,5 +598,20 @@ mod tests {
         assert_eq!(provider_limit("https://example.com/v1", "m"), Some(131_072));
         reset(false, true);
         assert_eq!(provider_limit("https://example.com/v1", "m"), None);
+    }
+
+    /// v2.86 按上限压时调用方记的几个位置一起挪（这一轮从哪条起、折到哪；== Swift / Qt 的 marks 用例）
+    #[test]
+    fn compact_moves_marks() {
+        let mut history: Vec<Value> = (0..10)
+            .flat_map(|n| {
+                [json!({ "role": "user", "content": format!("问 {n}") }), json!({ "role": "assistant", "content": "答".repeat(3_000) })]
+            })
+            .collect();
+        let mut marks = [14, 12];
+        let result = compact_marks(&mut history, &mut marks, 8_000, None);
+        assert!(result.dropped > 0);
+        assert!(marks[1] < 12 && marks[0] - marks[1] == 2, "{marks:?}");
+        assert_eq!(history[marks[0]]["content"], "问 7");
     }
 }

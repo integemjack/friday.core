@@ -1,7 +1,8 @@
 //! 上下文折叠：历史太长时，把较早轮次的工具结果、长参数、长回复压成摘要。
 //! - 主会话（两端的 AgentRunner.foldHistoryIfNeeded，要改会话存档，留在两端）：还没折叠的那部分超过 [`BUDGET`] 才触发，
 //!   一触发就把最近一轮之前的全部标成折叠；重建历史时用这里的 [`text`]、[`arguments`]、[`tool_result`] 写摘要
-//! - 子 Agent 会话（v1.19，在线引擎）：[`apply`] 在请求历史上直接折叠，预算是主会话的两倍
+//! - 子 Agent 会话（v1.19，在线引擎）：[`apply`] 在请求历史上直接折叠，预算是主会话的两倍；
+//!   v2.86 折过的步骤也有上限：[`trim`] 把最早的整步去掉（== Swift / Qt 的 SessionFolding.trim）
 //!
 //! 两次折叠之间历史一直是同一个样子——不会每轮改写历史，让在线接口的前缀缓存反复失效。
 //! 字数按字形簇计（同 Swift 的 String.count / prefix / suffix：组合 emoji 算一个字）。
@@ -13,6 +14,9 @@ use unicode_segmentation::UnicodeSegmentation;
 
 /// 还没折叠的历史（不含系统提示和工具说明）超过多少估算 token 就折叠（主会话；子 Agent 会话是它的两倍）
 pub const BUDGET: i64 = 48_000;
+
+/// v2.86 一次运行（子 Agent、主 Agent 的一轮）里已折叠的步骤最多留多少（会话预算的四分之一）：超过就把最早的整步去掉（[`trim`]）
+pub const SESSION_FOLDED_BUDGET: i64 = BUDGET * 2 / 4;
 
 /// 结果不能截的工具：两端按各自的注册表给（任务状态工具的名字、会跑子 Agent 并返回它结果的工具）
 #[derive(Debug, Clone, Default)]
@@ -193,6 +197,112 @@ pub fn apply(history: &mut [Value], folded: &mut usize, budget: i64, echoes_reas
     Applied { steps, before: if steps > 0 { unfolded } else { 0 }, after }
 }
 
+/// 去掉了一次的结果
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Trimmed {
+    /// 这次去掉几步（0 = 没去）
+    pub steps: usize,
+    /// 这次运行一共去掉了几步
+    pub total: usize,
+    /// 整段历史去掉后的估算 token
+    pub after: i64,
+}
+
+/// 两条挨着的用户消息并成一条（正文接在后面；有图片的按多模态的写法拼）
+fn merged(first: &Value, second: &Value) -> Value {
+    let mut result = first.clone();
+    if let (Some(Value::String(a)), Some(Value::String(b))) = (first.get("content"), second.get("content")) {
+        result["content"] = Value::String(format!("{a}\n\n{b}"));
+        return result;
+    }
+    let parts = |entry: &Value| -> Vec<Value> {
+        match entry.get("content") {
+            Some(Value::Array(parts)) => parts.clone(),
+            other => vec![serde_json::json!({ "type": "text", "text": other.and_then(Value::as_str).unwrap_or("") })],
+        }
+    };
+    let mut all = parts(first);
+    all.extend(parts(second));
+    result["content"] = Value::Array(all);
+    result
+}
+
+/// v2.86 [start, folded) 里折叠过的部分估算超过 folded_budget 时，从最早的起整步去掉（助手消息连同它的工具结果；
+/// 用户消息一字不动），去到不到一半——成批做，两次之间历史不变。去掉的地方留一句说明（note 给的，参数是一共去掉几步），写在紧跟着的
+/// 那条助手消息的正文前面：下次最先去掉的就是它，说明跟着往后挪。去掉后挨在一起的两条用户消息并成一条（有的接口不认连着两条）。
+/// start：从哪条起归这次运行（主智能体是这一轮的开头，之前几轮归两端）；dropped：一共去掉了几步（调用方保存）
+pub fn trim(
+    history: &mut Vec<Value>,
+    start: usize,
+    folded: &mut usize,
+    dropped: &mut usize,
+    folded_budget: i64,
+    note: &dyn Fn(usize) -> String,
+) -> Trimmed {
+    if folded_budget <= 0 || start >= *folded || *folded > history.len() {
+        return Trimmed::default();
+    }
+    let mut total = estimated_tokens(&history[start..*folded]);
+    if total <= folded_budget {
+        return Trimmed::default();
+    }
+    let role = |entry: &Value| entry.get("role").and_then(Value::as_str).unwrap_or("").to_string();
+    let mut drop = vec![false; history.len()];
+    let mut steps = 0;
+    let mut index = start;
+    while index < *folded && total > folded_budget / 2 {
+        if role(&history[index]) != "assistant" {
+            index += 1;
+            continue;
+        }
+        let mut end = index + 1;
+        while end < *folded && role(&history[end]) == "tool" {
+            end += 1;
+        }
+        for k in index..end {
+            drop[k] = true;
+            total -= entry_tokens(&history[k]);
+        }
+        steps += 1;
+        index = end;
+    }
+    if steps == 0 {
+        return Trimmed::default();
+    }
+    *dropped += steps;
+    let text = note(*dropped);
+    let mut rebuilt: Vec<Value> = Vec::new();
+    let mut new_folded = 0;
+    let mut placed = false;
+    for (k, entry) in history.iter().enumerate() {
+        if k == *folded {
+            new_folded = rebuilt.len();
+        }
+        if drop[k] {
+            continue;
+        }
+        let mut entry = entry.clone();
+        // 最后一段去掉的之后第一条助手消息：说明写在它前面
+        if !placed && k >= index && role(&entry) == "assistant" {
+            let body = entry.get("content").and_then(Value::as_str).unwrap_or("").to_string();
+            entry["content"] = Value::String(if body.is_empty() { text.clone() } else { format!("{text}\n\n{body}") });
+            placed = true;
+        }
+        if k > start && k <= index && role(&entry) == "user" && rebuilt.last().is_some_and(|last| role(last) == "user") {
+            let last = rebuilt.pop().unwrap();
+            rebuilt.push(merged(&last, &entry));
+            continue;
+        }
+        rebuilt.push(entry);
+    }
+    if *folded >= history.len() {
+        new_folded = rebuilt.len();
+    }
+    *history = rebuilt;
+    *folded = new_folded;
+    Trimmed { steps, total: *dropped, after: estimated_tokens(history) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,5 +432,48 @@ mod tests {
         let mut echo_folded = 0;
         apply(&mut echo, &mut echo_folded, 30_000, true, &special);
         assert_eq!(echo[1]["reasoning_content"], history[1]["reasoning_content"]);
+    }
+
+    /// v2.86 == Swift SelfTests.sessionTrim / Qt TestContextAssist::sessionTrim：最早的整步去掉、用户消息不动（挨在一起的并成一条）、
+    /// 说明写在后面第一条回答前面、位置跟着挪、没新折叠不再动
+    #[test]
+    fn trims() {
+        let step = |index: usize| {
+            vec![
+                json!({ "role": "assistant", "content": format!("第 {index} 步"),
+                        "tool_calls": [{ "id": format!("c{index}"), "type": "function", "function": { "name": "run_shell", "arguments": format!(r#"{{"command": "cat a{index}"}}"#) } }] }),
+                json!({ "role": "tool", "tool_call_id": format!("c{index}"), "name": "run_shell", "content": "出".repeat(2_000) }),
+            ]
+        };
+        let user = |text: &str| json!({ "role": "user", "content": text });
+        let mut history = vec![user("上一轮"), json!({ "role": "assistant", "content": "好" }), user("这一轮的任务")];
+        history.extend(step(0));
+        history.extend(step(1));
+        history.push(user("（工作中补充）也看看 b"));
+        for index in 2..12 {
+            history.extend(step(index));
+        }
+        let special = special();
+        let mut folded = 2;
+        let mut dropped = 0;
+        apply(&mut history, &mut folded, 4_000, false, &special);
+        let count = history.len();
+        let note = |total: usize| format!("（第 7 轮较早的 {total} 步已省略，用 read_history 看）");
+        let result = trim(&mut history, 2, &mut folded, &mut dropped, 1_500, &note);
+        assert!(result.steps > 1 && dropped == result.steps && result.total == dropped && history.len() < count, "{result:?}");
+        assert_eq!(history[0]["content"], "上一轮");
+        assert_eq!(history[1]["content"], "好");
+        assert_eq!(history[2]["content"], "这一轮的任务\n\n（工作中补充）也看看 b", "去掉后挨着的两条用户消息并成一条");
+        assert_eq!(history[3]["role"], "assistant");
+        assert!(history[3]["content"].as_str().unwrap().starts_with(&format!("（第 7 轮较早的 {} 步已省略", result.steps)));
+        assert!(folded > 3 && folded < history.len() && history[folded]["role"] == "assistant", "折到哪跟着挪：{folded}");
+        assert_eq!(history.last().unwrap()["content"].as_str().unwrap().chars().count(), 2_000, "最新的一步不动");
+        let again = history.clone();
+        assert_eq!(trim(&mut history, 2, &mut folded, &mut dropped, 1_500, &note).steps, 0, "没新折叠不再动");
+        assert_eq!(history, again);
+        // 上限 0 不去
+        let mut untouched = again.clone();
+        let mut zero = folded;
+        assert_eq!(trim(&mut untouched, 2, &mut zero, &mut 0, 0, &note), Trimmed::default());
     }
 }
