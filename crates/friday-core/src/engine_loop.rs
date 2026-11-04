@@ -27,8 +27,8 @@ use crate::repetition;
 
 /// 输出被长度上限截断后最多自动接着写几次
 pub const MAX_AUTO_CONTINUES: i64 = 5;
-/// 给模型看的截图那条用户消息的开头（== Swift ModelImages.marker、Qt ModelImages::marker）
-pub const IMAGE_MARKER: &str = "［工具截图］";
+/// 给模型看的工具的图那条用户消息的开头（== Swift ModelImages.marker、Qt ModelImages::marker；Friday v2.96 起截图、读到的图片都算）
+pub const IMAGE_MARKER: &str = "［工具图片］";
 
 /// 不变的：哪个引擎（== EngineConfig）
 #[derive(Debug, Clone, Default)]
@@ -526,7 +526,8 @@ impl Loop {
         json!({ "next": "tools", "calls": calls })
     }
 
-    /// 工具跑完：结果记进历史；截图那条用户消息（两端拼好的，images 是这一步拍了几张）只给最近两张留图；接上用户中途补充的话；
+    /// 工具跑完：结果记进历史；图那条用户消息（两端拼好的，images 是这一步附了几张：Friday v2.96 起一步最多 4 张）连同更早几步的
+    /// 只给最近两张留图，更早的换成一句话；接上用户中途补充的话；
     /// 每步说差不多的话第 3、6…次提醒
     pub fn tool_results(
         &mut self,
@@ -557,7 +558,7 @@ impl Loop {
                 if kept + images <= 2 {
                     continue;
                 }
-                self.history[index] = user(format!("{IMAGE_MARKER}（较早的截图，已省略）"));
+                self.history[index] = user(format!("{IMAGE_MARKER}（较早的图，已省略）"));
             }
             self.push(message);
         }
@@ -779,7 +780,7 @@ mod tests {
         }
         let shots: Vec<&Value> = engine.history().iter().filter(|entry| entry["role"] == "user" && entry["content"].is_array()).collect();
         assert_eq!(shots.len(), 2);
-        assert!(engine.history().iter().any(|entry| entry["content"] == json!(format!("{IMAGE_MARKER}（较早的截图，已省略）"))));
+        assert!(engine.history().iter().any(|entry| entry["content"] == json!(format!("{IMAGE_MARKER}（较早的图，已省略）"))));
     }
 
     fn special() -> Special {

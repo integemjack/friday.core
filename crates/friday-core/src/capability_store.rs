@@ -2,6 +2,7 @@
 //! - capabilities.json：提供方按类型分三组存——在线的放 entries、脚本提供方放 scriptEntries（旧版本不认识 script 类型，混在一起会整个
 //!   文件读不出来）、本地能力（Power）放 powerEntries；disabledKinds 一直写空数组（旧版本解码时要求有这个键）。
 //!   旧版本按能力整体关掉的（disabledKinds 非空）读入时交给两端迁移到每个提供方上
+//!   Friday v2.96 起还有 models：每项能力选的模型（{能力: "服务 id|模型"}），选过才写
 //! - jobs.json：生视频这类异步任务，只保留最近 50 个
 //!
 //! 每个条目的解码（认不出的类型跳过）、注册表、后端留在两端；这里只管文件的结构和写法（键排序、两空格缩进）。
@@ -12,10 +13,10 @@ use serde_json::{Value, json};
 
 use crate::{swift_json, writer};
 
-/// 读 capabilities.json：{entries: [三组合在一起的条目], legacyDisabledKinds: [旧版本按能力整体关掉的]}；读不出来是空的
+/// 读 capabilities.json：{entries: [三组合在一起的条目], legacyDisabledKinds: [旧版本按能力整体关掉的], models: {能力: 模型}}；读不出来是空的
 pub fn load_config(path: &Path) -> Value {
     let file = std::fs::read_to_string(path).ok().and_then(|text| serde_json::from_str::<Value>(&text).ok());
-    let Some(Value::Object(file)) = file else { return json!({ "entries": [], "legacyDisabledKinds": [] }) };
+    let Some(Value::Object(file)) = file else { return json!({ "entries": [], "legacyDisabledKinds": [], "models": {} }) };
     let mut entries = Vec::new();
     for key in ["entries", "scriptEntries", "powerEntries"] {
         if let Some(Value::Array(items)) = file.get(key) {
@@ -24,11 +25,16 @@ pub fn load_config(path: &Path) -> Value {
     }
     let legacy: Vec<Value> =
         file.get("disabledKinds").and_then(Value::as_array).into_iter().flatten().filter(|kind| kind.is_string()).cloned().collect();
-    json!({ "entries": entries, "legacyDisabledKinds": legacy })
+    // models 里有不是字符串的就整个不认（同 Swift 的 try? decodeIfPresent([String: String])）
+    let models = match file.get("models") {
+        Some(Value::Object(models)) if models.values().all(Value::is_string) => Value::Object(models.clone()),
+        _ => json!({}),
+    };
+    json!({ "entries": entries, "legacyDisabledKinds": legacy, "models": models })
 }
 
-/// capabilities.json 要写的内容（按 type 分三组）
-pub fn config_text(entries: &[Value]) -> String {
+/// capabilities.json 要写的内容（按 type 分三组；models 空的不写）
+pub fn config_text(entries: &[Value], models: &Value) -> String {
     let group = |wanted: Option<&str>| -> Vec<Value> {
         entries
             .iter()
@@ -42,13 +48,21 @@ pub fn config_text(entries: &[Value]) -> String {
             .cloned()
             .collect()
     };
-    let file = json!({ "entries": group(None), "disabledKinds": [], "scriptEntries": group(Some("script")), "powerEntries": group(Some("power")) });
+    let mut file = json!({ "entries": group(None), "disabledKinds": [], "scriptEntries": group(Some("script")), "powerEntries": group(Some("power")) });
+    if models.as_object().is_some_and(|models| !models.is_empty()) {
+        file["models"] = models.clone();
+    }
     swift_json::pretty(&file)
 }
 
 /// 写 capabilities.json（就地写完再返回：两端紧接着可能再读）
 pub fn save_config(path: &Path, entries: &[Value]) -> Result<(), String> {
-    writer::write_now(path, config_text(entries).as_bytes()).map_err(|error| error.to_string())
+    save_config_with_models(path, entries, &Value::Null)
+}
+
+/// 同上，连每项能力选的模型一起写（Friday v2.96；空的不写）
+pub fn save_config_with_models(path: &Path, entries: &[Value], models: &Value) -> Result<(), String> {
+    writer::write_now(path, config_text(entries, models).as_bytes()).map_err(|error| error.to_string())
 }
 
 /// 读 jobs.json（不是数组是空的）
@@ -74,16 +88,19 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("friday-capabilities-{}", std::process::id()));
         let path = dir.join("capabilities.json");
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(load_config(&path), json!({ "entries": [], "legacyDisabledKinds": [] }));
+        assert_eq!(load_config(&path), json!({ "entries": [], "legacyDisabledKinds": [], "models": {} }));
         let entries =
             vec![json!({ "id": "a", "type": "dashscope" }), json!({ "id": "b", "type": "script" }), json!({ "id": "c", "type": "power" })];
         save_config(&path, &entries).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.starts_with("{\n  \"disabledKinds\" : [\n\n  ],\n  \"entries\" : ["));
+        assert!(!text.contains("models"));
         let loaded = load_config(&path);
         assert_eq!(loaded["entries"].as_array().unwrap().len(), 3);
-        std::fs::write(&path, r#"{"entries":[{"id":"x","type":"old"},3],"disabledKinds":["video"]}"#).unwrap();
-        assert_eq!(load_config(&path), json!({ "entries": [{ "id": "x", "type": "old" }], "legacyDisabledKinds": ["video"] }));
+        save_config_with_models(&path, &entries, &json!({ "image": "qwen|wanx" })).unwrap();
+        assert_eq!(load_config(&path)["models"], json!({ "image": "qwen|wanx" }));
+        std::fs::write(&path, r#"{"entries":[{"id":"x","type":"old"},3],"disabledKinds":["video"],"models":{"image":1}}"#).unwrap();
+        assert_eq!(load_config(&path), json!({ "entries": [{ "id": "x", "type": "old" }], "legacyDisabledKinds": ["video"], "models": {} }));
         let jobs: Vec<Value> = (0..60).map(|index| json!({ "id": index })).collect();
         let jobs_path = dir.join("jobs.json");
         save_jobs(&jobs_path, &jobs).unwrap();

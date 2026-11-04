@@ -1,30 +1,23 @@
-//! 自动安装 / 升级远程机器上的 Friday（docs/REMOTE.md §9；== Swift Remote/RemoteDeploy、Qt remote/RemoteDeploy）里两端共有的部分：
-//! - 远程脚本（看装了什么、装桌面端 / 服务端包、用 apt-get 装缺的系统库）只留这一份；拼成 sh -c '…' 或 PowerShell 的 -EncodedCommand
+//! 自动安装 / 升级远程机器上的 Friday（docs/REMOTE.md §9；== Swift Remote/RemoteDeploy、Qt remote/RemoteDeploy）里两端共有的部分。
+//! Friday v2.87 起一律装服务端包（不再装桌面端跑无头模式、不再替用户装缺的系统库）：
+//! - 远程脚本（看装了什么、装 / 换上服务端包，以前的客户端装的桌面端在 Linux 上没有图形桌面或跑不起来时换上后删掉）只留这一份；
+//!   拼成 sh -c '…' 或 PowerShell 的 -EncodedCommand
 //! - 远程输出里「FRIDAY-DEPLOY …」那几行的解析，按系统和架构定包的键（linux-x64、windows-x64、macos-arm64…）
-//! - 从 latest.json 挑这个渠道、这个平台的包（Beta 渠道在正式版和 Beta 里取版本高的），或从本地目录挑
-//! - 版本比较、该不该升级、这台该装服务端包还是桌面端、客户端能不能管这台的安装、失败原因的说法
+//! - 从 latest.json 挑这个渠道、这个平台的服务端包（Beta 渠道在正式版和 Beta 里取版本高的），或从本地目录挑
+//! - 版本比较、该不该升级、客户端能不能管这台的安装、失败原因的说法
 //!
 //! 经 ssh 跑命令、下载和核对包、把包流过去留在两端。
 
 use std::path::Path;
 
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 const POSIX_INSPECT: &str = r##"echo "FRIDAY-DEPLOY uname $(uname -s) $(uname -m)"
 ver() { o="$("$1" server --version 2>/dev/null)" || return 1; printf %s "$o" | sed -n "s/.*\"version\" *: *\"\([0-9.]*\)\".*/\1/p"; }
-if [ "$(uname -s)" = Darwin ]; then
-  echo "FRIDAY-DEPLOY desktop yes"
-else
-  d=no
-  for x in /usr/share/xsessions/* /usr/share/wayland-sessions/* /etc/systemd/system/display-manager.service; do [ -e "$x" ] && d=yes; done
-  echo "FRIDAY-DEPLOY desktop $d"
+if [ "$(uname -s)" != Darwin ]; then
   f="$HOME/.local/opt/Friday/usr/bin/friday"
   if [ -e "$f" ]; then v="$(ver "$f")"; echo "FRIDAY-DEPLOY managed ${v:-broken}"; fi
   if [ -e /opt/friday/usr/bin/friday ]; then v="$(ver /opt/friday/usr/bin/friday)"; echo "FRIDAY-DEPLOY system ${v:-broken}"; fi
-  for x in "$HOME"/.local/opt/.friday-stage-*; do
-    case "$x" in *.part) continue ;; esac
-    [ -f "$x/Friday/usr/bin/friday" ] && echo "FRIDAY-DEPLOY staged ${x##*/.friday-stage-}"
-  done
 fi
 l="$HOME/.friday-server/bin/friday-server"
 if [ -e "$l" ] || [ -L "$l" ]; then
@@ -38,117 +31,7 @@ for x in "$HOME"/.friday-server/versions/*/bin/friday-server; do
 done
 exit 0"##;
 
-const LINUX_DEPLOY: &str = r##"o="$HOME/.local/opt"; v="@VERSION@"; s="$o/.friday-stage-$v"; t="$o/Friday"; l="$HOME/.friday-server"
-fail() { echo "FRIDAY-DEPLOY fail $*"; exit 1; }
-running() { for p in /proc/[0-9]*; do x="$(readlink "$p/exe" 2>/dev/null)" || continue; case "$x" in "$1"/*) return 0 ;; esac; done; return 1; }
-mkdir -p "$o" || fail mkdir
-if [ "@UPLOAD@" = 1 ]; then
-  rm -rf "$s.part" && mkdir -p "$s.part" || fail mkdir
-  tar -xzf - -C "$s.part" || { rm -rf "$s.part"; fail extract; }
-  [ -f "$s.part/Friday/usr/bin/friday" ] || { rm -rf "$s.part"; fail layout; }
-  { rm -rf "$s" && mv "$s.part" "$s"; } || fail move
-fi
-n="$t"; [ -d "$s/Friday" ] && n="$s/Friday"
-[ -f "$n/usr/bin/friday" ] || fail layout
-if ! e="$("$n/usr/bin/friday" server --version 2>&1)"; then
-  m="$(ldd "$n/usr/bin/friday" 2>/dev/null | awk "/not found/ {print \$1}" | sort -u)"
-  if [ -n "$m" ]; then
-    for x in $m; do echo "FRIDAY-DEPLOY missing $x $(awk -v l="$x" "\$1 == l {print \$2; exit}" "$n/usr/share/friday/system-libs.txt" 2>/dev/null)"; done
-    if [ "$(id -u)" = 0 ]; then echo "FRIDAY-DEPLOY privilege root"; elif sudo -n true 2>/dev/null; then echo "FRIDAY-DEPLOY privilege sudo"; else echo "FRIDAY-DEPLOY privilege none"; fi
-    for x in apt-get dnf yum zypper pacman; do command -v "$x" >/dev/null 2>&1 && { echo "FRIDAY-DEPLOY pm $x"; break; }; done
-    fail libs
-  fi
-  fail run "$(printf %s "$e" | tr -s "\n" " " | head -c 600)"
-fi
-echo "FRIDAY-DEPLOY installed $(printf %s "$e" | sed -n "s/.*\"version\" *: *\"\([0-9.]*\)\".*/\1/p")"
-b=0
-if [ "$n" != "$t" ]; then
-  if [ -d "$t" ] && running "$t"; then b=1
-  else
-    rm -rf "$o/.friday-old" || fail move
-    if [ -e "$t" ]; then mv "$t" "$o/.friday-old" || fail move; fi
-    mv "$n" "$t" || { [ -e "$o/.friday-old" ] && mv "$o/.friday-old" "$t"; fail move; }
-    rm -rf "$s" "$o/.friday-old"
-  fi
-fi
-if [ "$b" = 0 ]; then
-  for x in "$o"/.friday-stage-*; do [ -e "$x" ] && rm -rf "$x"; done
-  mkdir -p "$HOME/.local/bin" && ln -sfn "$t/usr/bin/friday" "$HOME/.local/bin/friday"
-  d=no
-  for x in /usr/share/xsessions/* /usr/share/wayland-sessions/* /etc/systemd/system/display-manager.service; do [ -e "$x" ] && d=yes; done
-  if [ "$d" = yes ] && [ -f "$t/usr/share/applications/friday.desktop" ]; then
-    a="$HOME/.local/share/applications"
-    mkdir -p "$a" && sed -e "s|^Exec=.*|Exec=$t/AppRun|" -e "s|^Icon=.*|Icon=$t/usr/share/icons/hicolor/256x256/apps/friday.png|" \
-      "$t/usr/share/applications/friday.desktop" > "$a/friday.desktop"
-  fi
-  if { [ -e "$l" ] || [ -L "$l/bin" ]; } && [ "$(readlink "$l/bin/friday-server" 2>/dev/null)" != "$t/usr/bin/friday" ]; then
-    if running "$l"; then b=1
-    else rm -rf "$l/versions" "$l/bin" && mkdir -p "$l/bin" && ln -sfn "$t/usr/bin/friday" "$l/bin/friday-server"
-    fi
-  fi
-fi
-if [ "$b" = 1 ]; then echo "FRIDAY-DEPLOY busy"; else echo "FRIDAY-DEPLOY switched"; fi
-exit 0"##;
-
-const POSIX_INSTALL_LIBRARIES: &str = r##"S=; [ "$(id -u)" = 0 ] || S="sudo -n"
-i() { $S env DEBIAN_FRONTEND=noninteractive apt-get "$@"; }
-i install -y --no-install-recommends @PACKAGES@ || { i update && i install -y --no-install-recommends @PACKAGES@; } || { echo "FRIDAY-DEPLOY fail apt"; exit 1; }
-echo "FRIDAY-DEPLOY libraries"
-exit 0"##;
-
-const WINDOWS_INSPECT: &str = r##""FRIDAY-DEPLOY uname Windows $env:PROCESSOR_ARCHITECTURE"
-if (Test-Path -LiteralPath (Join-Path $env:SystemRoot 'explorer.exe')) { 'FRIDAY-DEPLOY desktop yes' } else { 'FRIDAY-DEPLOY desktop no' }
-function Ver($exe) { try { $o = (& $exe server --version 2>$null | Out-String); if ($o -match '"version"\s*:\s*"([0-9.]+)"') { return $Matches[1] } } catch {}; return 'broken' }
-$u = Join-Path $env:LOCALAPPDATA 'Programs\Friday\friday.com'
-if (Test-Path -LiteralPath $u) { "FRIDAY-DEPLOY managed $(Ver $u)" }
-$m = Join-Path $env:ProgramFiles 'Friday\friday.com'
-if (Test-Path -LiteralPath $m) { "FRIDAY-DEPLOY system $(Ver $m)" }
-$s = Join-Path $env:LOCALAPPDATA 'Programs'
-if (Test-Path -LiteralPath $s) {
-  Get-ChildItem -LiteralPath $s -Filter 'Friday-setup-*.exe' -File | ForEach-Object { if ($_.Name -match '^Friday-setup-([0-9.]+)\.exe$') { "FRIDAY-DEPLOY staged $($Matches[1])" } }
-}
-$l = Join-Path $env:USERPROFILE '.friday-server\bin\friday-server.exe'
-if (Test-Path -LiteralPath $l) {
-  $v = 'broken'; try { $o = (& $l --version 2>$null | Out-String); if ($o -match '"version"\s*:\s*"([0-9.]+)"') { $v = $Matches[1] } } catch {}
-  "FRIDAY-DEPLOY server $v"
-}
-$vs = Join-Path $env:USERPROFILE '.friday-server\versions'
-if (Test-Path -LiteralPath $vs) {
-  Get-ChildItem -LiteralPath $vs -Directory | ForEach-Object {
-    if (Test-Path -LiteralPath (Join-Path $_.FullName 'bin\friday-server.exe')) { "FRIDAY-DEPLOY serverhas $($_.Name)" }
-  }
-}
-exit 0"##;
-
-const WINDOWS_DEPLOY: &str = r##"$v = '@VERSION@'; $d = Join-Path $env:LOCALAPPDATA 'Programs\Friday'; $p = Join-Path $env:LOCALAPPDATA "Programs\Friday-setup-$v.exe"
-function Fail($m) { "FRIDAY-DEPLOY fail $m"; exit 1 }
-function Ver($exe) { try { $o = (& $exe server --version 2>$null | Out-String); if ($o -match '"version"\s*:\s*"([0-9.]+)"') { return $Matches[1] } } catch {}; return '' }
-try { New-Item -ItemType Directory -Force -Path (Split-Path -Parent $p) -ErrorAction Stop | Out-Null } catch { Fail 'mkdir' }
-if ('@UPLOAD@' -eq '1') {
-  try {
-    $in = [Console]::OpenStandardInput(); $out = [IO.File]::Create("$p.part")
-    try { $in.CopyTo($out) } finally { $out.Close() }
-    Move-Item -LiteralPath "$p.part" -Destination $p -Force -ErrorAction Stop
-  } catch { Remove-Item -LiteralPath "$p.part" -Force -ErrorAction SilentlyContinue; Fail 'extract' }
-}
-$e = Join-Path $d 'friday.com'
-if (Test-Path -LiteralPath $p) {
-  $busy = Get-CimInstance Win32_Process -Filter "Name = 'friday.exe'" -ErrorAction SilentlyContinue |
-    Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($d + '\', [StringComparison]::OrdinalIgnoreCase) }
-  if ($busy) { 'FRIDAY-DEPLOY busy'; exit 0 }
-  $r = Start-Process -FilePath $p -ArgumentList '/S', '/CURRENTUSER' -Wait -PassThru -WindowStyle Hidden
-  if ($r.ExitCode -ne 0) { Fail "run setup exit $($r.ExitCode), see %TEMP%\friday-setup.log" }
-  Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
-}
-if (-not (Test-Path -LiteralPath $e)) { Fail 'layout' }
-$c = Ver $e
-if (-not $c) { Fail 'run friday.com server --version failed' }
-Get-ChildItem -LiteralPath (Split-Path -Parent $p) -Filter 'Friday-setup-*.exe' -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-"FRIDAY-DEPLOY installed $c"
-'FRIDAY-DEPLOY switched'
-exit 0"##;
-
-const POSIX_SERVER_DEPLOY: &str = r##"d="$HOME/.friday-server"; v="@VERSION@"; k="@KEEP@"; t="$d/versions/$v"
+const POSIX_SERVER_DEPLOY: &str = r##"d="$HOME/.friday-server"; v="@VERSION@"; k="@KEEP@"; t="$d/versions/$v"; m="$HOME/.local/opt/Friday"; b=0
 mkdir -p "$d/versions" || { echo "FRIDAY-DEPLOY fail mkdir"; exit 1; }
 if [ "@UPLOAD@" = 1 ]; then
   rm -rf "$t.part" && mkdir -p "$t.part" || { echo "FRIDAY-DEPLOY fail mkdir"; exit 1; }
@@ -163,11 +46,6 @@ fi
 [ -f "$t/bin/friday-server" ] || { echo "FRIDAY-DEPLOY fail layout"; exit 1; }
 o="$("$t/bin/friday-server" --version 2>&1)" || { echo "FRIDAY-DEPLOY fail run $(printf %s "$o" | tr -s "\n" " " | head -c 600)"; exit 1; }
 echo "FRIDAY-DEPLOY installed $(printf %s "$o" | sed -n "s/.*\"version\" *: *\"\([0-9.]*\)\".*/\1/p")"
-f="$HOME/.local/opt/Friday/usr/bin/friday"
-if [ "$(uname -s)" != Darwin ] && [ -e "$f" ] && ! "$f" server --version >/dev/null 2>&1; then
-  [ "$(readlink "$HOME/.local/bin/friday")" = "$f" ] && rm -f "$HOME/.local/bin/friday"
-  rm -rf "$HOME/.local/opt/Friday"
-fi
 if [ -d "$d/bin" ] && [ ! -L "$d/bin" ]; then
   if [ -n "$k" ] && [ ! -e "$d/versions/$k" ]; then
     mkdir -p "$d/versions/$k" && mv "$d/bin" "$d/versions/$k/bin"
@@ -176,11 +54,41 @@ if [ -d "$d/bin" ] && [ ! -L "$d/bin" ]; then
   fi || { echo "FRIDAY-DEPLOY busy"; exit 0; }
 fi
 ln -sfn "versions/$v/bin" "$d/bin" || { echo "FRIDAY-DEPLOY busy"; exit 0; }
-echo "FRIDAY-DEPLOY switched"
+if [ "$(uname -s)" != Darwin ] && [ -e "$m/usr/bin/friday" ]; then
+  g=no
+  for x in /usr/share/xsessions/* /usr/share/wayland-sessions/* /etc/systemd/system/display-manager.service; do [ -e "$x" ] && g=yes; done
+  if [ "$g" = no ] || ! "$m/usr/bin/friday" server --version >/dev/null 2>&1; then
+    for p in /proc/[0-9]*; do x="$(readlink "$p/exe" 2>/dev/null)" || continue; case "$x" in "$m"/*) b=1; break ;; esac; done
+    if [ "$b" = 0 ]; then
+      [ "$(readlink "$HOME/.local/bin/friday")" = "$m/usr/bin/friday" ] && rm -f "$HOME/.local/bin/friday"
+      rm -rf "$m" "$HOME"/.local/opt/.friday-stage-*
+    fi
+  fi
+fi
+if [ "$b" = 1 ]; then echo "FRIDAY-DEPLOY busy"; else echo "FRIDAY-DEPLOY switched"; fi
 for x in "$d"/versions/*; do
   n="${x##*/}"
   [ "$n" = "$v" ] || [ "$n" = "$k" ] || [ "$n" = "*" ] || rm -rf "$x"
 done
+exit 0"##;
+
+const WINDOWS_INSPECT: &str = r##""FRIDAY-DEPLOY uname Windows $env:PROCESSOR_ARCHITECTURE"
+function Ver($exe) { try { $o = (& $exe server --version 2>$null | Out-String); if ($o -match '"version"\s*:\s*"([0-9.]+)"') { return $Matches[1] } } catch {}; return 'broken' }
+$u = Join-Path $env:LOCALAPPDATA 'Programs\Friday\friday.com'
+if (Test-Path -LiteralPath $u) { "FRIDAY-DEPLOY managed $(Ver $u)" }
+$m = Join-Path $env:ProgramFiles 'Friday\friday.com'
+if (Test-Path -LiteralPath $m) { "FRIDAY-DEPLOY system $(Ver $m)" }
+$l = Join-Path $env:USERPROFILE '.friday-server\bin\friday-server.exe'
+if (Test-Path -LiteralPath $l) {
+  $v = 'broken'; try { $o = (& $l --version 2>$null | Out-String); if ($o -match '"version"\s*:\s*"([0-9.]+)"') { $v = $Matches[1] } } catch {}
+  "FRIDAY-DEPLOY server $v"
+}
+$vs = Join-Path $env:USERPROFILE '.friday-server\versions'
+if (Test-Path -LiteralPath $vs) {
+  Get-ChildItem -LiteralPath $vs -Directory | ForEach-Object {
+    if (Test-Path -LiteralPath (Join-Path $_.FullName 'bin\friday-server.exe')) { "FRIDAY-DEPLOY serverhas $($_.Name)" }
+  }
+}
 exit 0"##;
 
 const WINDOWS_SERVER_DEPLOY: &str = r##"$d = Join-Path $env:USERPROFILE '.friday-server'; $v = '@VERSION@'; $k = '@KEEP@'
@@ -237,16 +145,8 @@ exit 0"##;
 /// 远程输出里的「FRIDAY-DEPLOY …」那几行
 pub fn parse_report(output: &str) -> Value {
     let marker = "FRIDAY-DEPLOY ";
-    let mut report = json!({ "system": "", "machine": "", "desktop": false, "managed": "", "systemInstall": "", "staged": [], "serverPackage": "",
-        "serverVersions": [], "installedVersion": "", "switched": false, "busy": false, "failure": "", "missing": [], "privilege": "", "packageManager": "" });
-    let add_once = |list: &mut Value, value: &str| {
-        if let Some(items) = list.as_array_mut()
-            && !value.is_empty()
-            && !items.iter().any(|item| item == value)
-        {
-            items.push(json!(value));
-        }
-    };
+    let mut report = json!({ "system": "", "machine": "", "managed": "", "systemInstall": "", "serverPackage": "", "serverVersions": [],
+        "installedVersion": "", "switched": false, "busy": false, "failure": "" });
     for raw in crate::task_state::split_lines(output) {
         let line = raw.trim_matches([' ', '\t']);
         let Some(at) = line.find(marker) else { continue };
@@ -259,75 +159,29 @@ pub fn parse_report(output: &str) -> Value {
                 report["system"] = json!(parts.first().copied().unwrap_or(""));
                 report["machine"] = json!(parts.get(1).copied().unwrap_or(""));
             }
-            "desktop" => report["desktop"] = json!(value == "yes"),
             "managed" => report["managed"] = json!(value),
             "system" => report["systemInstall"] = json!(value),
-            "staged" => add_once(&mut report["staged"], value),
             "server" => report["serverPackage"] = json!(value),
-            "serverhas" => add_once(&mut report["serverVersions"], value),
+            "serverhas" => {
+                if let Some(items) = report["serverVersions"].as_array_mut()
+                    && !value.is_empty()
+                    && !items.iter().any(|item| item == value)
+                {
+                    items.push(json!(value));
+                }
+            }
             "installed" => report["installedVersion"] = json!(value),
             "switched" => report["switched"] = json!(true),
             "busy" => report["busy"] = json!(true),
-            "missing" => {
-                if let Some(soname) = parts.first()
-                    && let Some(items) = report["missing"].as_array_mut()
-                {
-                    items.push(json!({ "soname": soname, "package": parts.get(1).copied().unwrap_or("") }));
-                }
-            }
-            "privilege" => report["privilege"] = json!(value),
-            "pm" => report["packageManager"] = json!(value),
             "fail" => report["failure"] = json!(if value.is_empty() { "unknown" } else { value }),
             _ => {}
         }
     }
-    let packages = missing_packages(&report);
-    report["missingPackages"] = json!(packages);
-    report["canInstallLibraries"] = json!(can_install_libraries(&report));
-    report["libraryCommand"] = json!(library_command(&report));
     report
 }
 
 fn text<'a>(value: &'a Value, key: &str) -> &'a str {
     value.get(key).and_then(Value::as_str).unwrap_or("")
-}
-
-fn missing(report: &Value) -> Vec<(String, String)> {
-    report["missing"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|item| (text(item, "soname").to_string(), text(item, "package").to_string()))
-        .collect()
-}
-
-/// 要装的 deb 包（去重）
-pub fn missing_packages(report: &Value) -> Vec<String> {
-    let mut packages: Vec<String> = Vec::new();
-    for (_, package) in missing(report) {
-        if !package.is_empty() && !packages.contains(&package) {
-            packages.push(package);
-        }
-    }
-    packages
-}
-
-/// 缺的库都查得到 deb 包名、远程有 apt-get、能提权：客户端可以替用户装
-pub fn can_install_libraries(report: &Value) -> bool {
-    let missing = missing(report);
-    !missing.is_empty()
-        && text(report, "packageManager") == "apt-get"
-        && matches!(text(report, "privilege"), "root" | "sudo")
-        && missing.iter().all(|(_, package)| is_package_name(package))
-}
-
-/// 用户自己在远程装系统库的命令（给不了权限时显示）；认不出包时为空
-pub fn library_command(report: &Value) -> String {
-    let missing = missing(report);
-    if text(report, "packageManager") != "apt-get" || missing.is_empty() || !missing.iter().all(|(_, package)| is_package_name(package)) {
-        return String::new();
-    }
-    format!("sudo apt-get install -y {}", missing_packages(report).join(" "))
 }
 
 /// uname 或 Windows 的 PROCESSOR_ARCHITECTURE → 包的键；认不出为空
@@ -404,16 +258,11 @@ impl Version {
     }
 }
 
-/// latest.json 里这个渠道（stable / beta）、这个平台的包（server：服务端包）：Beta 渠道在正式版和 Beta 里取版本高的，正式版渠道只看正式版。
-/// 桌面包的协议版本取条目的 remoteProtocol，没写时用同一条目里服务端包的 protocol（先看这个平台的，没有就看别的）。
-/// 返回 {name, url, sha256, size, version, protocolVersion, server} 或 null
-pub fn from_manifest(manifest: &Value, channel: &str, key: &str, server: bool) -> Value {
+/// latest.json 里这个渠道（stable / beta）、这个平台的服务端包（assets[键].server）：Beta 渠道在正式版和 Beta 里取版本高的，
+/// 正式版渠道只看正式版；版本、协议版本是包里 server.json 的（条目里写的）。返回 {name, url, sha256, size, version, protocolVersion} 或 null
+pub fn from_manifest(manifest: &Value, channel: &str, key: &str) -> Value {
     let candidates: Vec<&Value> = if channel == "beta" { vec![&manifest["stable"], &manifest["beta"]] } else { vec![&manifest["stable"]] };
     let mut best: Option<(Value, Version)> = None;
-    let file_name = |file: &Value| {
-        let name = text(file, "name");
-        if name.is_empty() { text(file, "url").rsplit('/').next().unwrap_or("").to_string() } else { name.to_string() }
-    };
     for entry in candidates.into_iter().filter(|entry| entry.is_object()) {
         let Some(version) = Version::parse(text(entry, "tag")) else { continue };
         if let Some((_, current)) = &best
@@ -421,65 +270,32 @@ pub fn from_manifest(manifest: &Value, channel: &str, key: &str, server: bool) -
         {
             continue;
         }
-        let assets = &entry["assets"];
-        if server {
-            let file = &assets[key]["server"];
-            if text(file, "url").is_empty() {
-                continue;
-            }
-            let own = text(file, "version");
-            let package = json!({ "name": file_name(file), "url": text(file, "url"), "sha256": text(file, "sha256").to_lowercase(),
-                "size": file.get("size").and_then(Value::as_i64).unwrap_or(0),
-                "version": if own.is_empty() { version.version_string() } else { own.to_string() },
-                "protocolVersion": file.get("protocol").and_then(Value::as_i64).unwrap_or(0), "server": true });
-            best = Some((package, version));
-            continue;
-        }
-        let file = if key.starts_with("linux-") {
-            &assets[key]["tarball"]
-        } else if key.starts_with("windows-") {
-            &assets[key]["installer"]
-        } else {
-            &Value::Null
-        };
+        let file = &entry["assets"][key]["server"];
         if text(file, "url").is_empty() {
             continue;
         }
-        let mut protocol = entry.get("remoteProtocol").and_then(Value::as_i64).unwrap_or(0);
-        if protocol <= 0 {
-            let own = assets[key]["server"].get("protocol").and_then(Value::as_i64);
-            let others =
-                assets.as_object().into_iter().flat_map(Map::values).map(|asset| asset["server"].get("protocol").and_then(Value::as_i64));
-            protocol = std::iter::once(own).chain(others).flatten().find(|value| *value > 0).unwrap_or(0);
-        }
-        let package = json!({ "name": file_name(file), "url": text(file, "url"), "sha256": text(file, "sha256").to_lowercase(),
-            "size": file.get("size").and_then(Value::as_i64).unwrap_or(0), "version": version.version_string(), "protocolVersion": protocol, "server": false });
+        let name = match text(file, "name") {
+            "" => text(file, "url").rsplit('/').next().unwrap_or("").to_string(),
+            name => name.to_string(),
+        };
+        let own = text(file, "version");
+        let package = json!({ "name": name, "url": text(file, "url"), "sha256": text(file, "sha256").to_lowercase(),
+            "size": file.get("size").and_then(Value::as_i64).unwrap_or(0),
+            "version": if own.is_empty() { version.version_string() } else { own.to_string() },
+            "protocolVersion": file.get("protocol").and_then(Value::as_i64).unwrap_or(0) });
         best = Some((package, version));
     }
     best.map_or(Value::Null, |(package, _)| package)
 }
 
-/// 目录里这个平台的包（Friday-<标签>-linux-<架构>.tar.gz、Friday-<标签>-windows-x64-setup.exe，服务端包 Friday-<标签>-server-<键>.tar.gz，
-/// 标签最新的）；协议版本是 protocol（本机的）。返回 {file, name, size, version, protocolVersion, server} 或 null
-pub fn from_directory(directory: &Path, key: &str, server: bool, protocol: i64) -> Value {
-    let suffix = if server {
-        format!("-server-{key}.tar.gz")
-    } else if key.starts_with("linux-") {
-        format!("-{key}.tar.gz")
-    } else if key.starts_with("windows-") {
-        format!("-{key}-setup.exe")
-    } else {
-        return Value::Null;
-    };
+/// 目录里这个平台的服务端包（Friday-<标签>-server-<键>.tar.gz，标签最新的）；协议版本是 protocol（本机的）。
+/// 返回 {file, name, size, version, protocolVersion} 或 null
+pub fn from_directory(directory: &Path, key: &str, protocol: i64) -> Value {
+    let suffix = format!("-server-{key}.tar.gz");
     let mut best: Option<(Value, Version)> = None;
     for entry in std::fs::read_dir(directory).into_iter().flatten().flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        // 桌面包的名字里不能有 -server-（Friday-v2.55.0-server-linux-x64.tar.gz 也以 -linux-x64.tar.gz 结尾）
-        if !name.starts_with("Friday-")
-            || !name.ends_with(&suffix)
-            || (!server && name.contains("-server-"))
-            || name.len() < "Friday-".len() + suffix.len()
-        {
+        if !name.starts_with("Friday-") || !name.ends_with(&suffix) || name.len() < "Friday-".len() + suffix.len() {
             continue;
         }
         let Some(version) = Version::parse(&name["Friday-".len()..name.len() - suffix.len()]) else { continue };
@@ -490,8 +306,7 @@ pub fn from_directory(directory: &Path, key: &str, server: bool, protocol: i64) 
         }
         let size = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
         best = Some((
-            json!({ "file": crate::tool_files::slash(&entry.path()), "name": name, "size": size, "version": version.version_string(), "protocolVersion": protocol,
-                "server": server }),
+            json!({ "file": crate::tool_files::slash(&entry.path()), "name": name, "size": size, "version": version.version_string(), "protocolVersion": protocol }),
             version,
         ));
     }
@@ -544,32 +359,15 @@ pub fn should_upgrade(server: &str, package: &str, client: &str, client_is_devel
     true
 }
 
-/// 客户端可以管这台远程上的 Friday：装着受管的那份，或者除了服务端包什么都没装（别处装的 deb、%ProgramFiles% 不管）
+/// 客户端可以管这台远程上的 Friday：服务端包、以前的客户端装的桌面端（升级时改装服务端包）、什么都没装；
+/// 有别处装的桌面端（deb、%ProgramFiles%）时不管，桥先找它、它自己更新
 pub fn manages_install(report: &Value) -> bool {
-    !text(report, "system").is_empty() && (!text(report, "managed").is_empty() || text(report, "systemInstall").is_empty())
-}
-
-/// 这台该装服务端包：Mac；没有桌面、受管的桌面端没装或跑不起来的。其余装桌面端
-pub fn uses_server_package(report: &Value) -> bool {
-    if text(report, "system") == "Darwin" {
-        return true;
-    }
-    if report["desktop"].as_bool() == Some(true) {
-        return false;
-    }
-    matches!(text(report, "managed"), "" | "broken")
+    !text(report, "system").is_empty() && text(report, "systemInstall").is_empty()
 }
 
 /// 版本号只能是数字和点：要拼进远程的命令里
 pub fn is_version_text(text: &str) -> bool {
     !text.is_empty() && text.split('.').all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
-}
-
-/// deb 包名（拼进 apt-get 的命令里）
-pub fn is_package_name(text: &str) -> bool {
-    let mut chars = text.chars();
-    chars.next().is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || ".+-".contains(c))
 }
 
 /// 失败原因（远程脚本的 fail 那行）的说法
@@ -581,7 +379,6 @@ pub fn describe_failure(failure: &str) -> String {
         "extract" => "远程解不开 Friday 的安装包（Linux 要有 tar）".into(),
         "layout" => "Friday 的安装包里的文件不对".into(),
         "move" => "在远程放不好 Friday 的文件".into(),
-        "apt" => "用 apt-get 装系统库没成功".into(),
         "run" => {
             let hint = if detail.contains("GLIBC") {
                 "（远程的系统太旧：x64 的包要 glibc 2.35 以上，arm64 的要 2.39 以上）"
@@ -626,28 +423,15 @@ pub fn inspect_command(shell: &str) -> String {
     if shell == "posix" { posix_command(POSIX_INSPECT) } else { power_shell_command(WINDOWS_INSPECT) }
 }
 
-/// 装 / 换上的命令（server：装服务端包，keep 是服务正在用的版本）；版本号不对时为空
-pub fn deploy_command(shell: &str, version: &str, upload: bool, server: bool, keep: &str) -> String {
+/// 装 / 换上服务端包的命令（keep 是服务正在用的版本）；版本号不对时为空
+pub fn deploy_command(shell: &str, version: &str, upload: bool, keep: &str) -> String {
     if !is_version_text(version) || !(keep.is_empty() || is_version_text(keep)) {
         return String::new();
     }
     let posix = shell == "posix";
-    let template = match (server, posix) {
-        (true, true) => POSIX_SERVER_DEPLOY,
-        (true, false) => WINDOWS_SERVER_DEPLOY,
-        (false, true) => LINUX_DEPLOY,
-        (false, false) => WINDOWS_DEPLOY,
-    };
+    let template = if posix { POSIX_SERVER_DEPLOY } else { WINDOWS_SERVER_DEPLOY };
     let script = template.replace("@VERSION@", version).replace("@KEEP@", keep).replace("@UPLOAD@", if upload { "1" } else { "0" });
     if posix { posix_command(&script) } else { power_shell_command(&script) }
-}
-
-/// 用 apt-get 装系统库的命令；包名不对时为空
-pub fn install_libraries_command(packages: &[String]) -> String {
-    if packages.is_empty() || !packages.iter().all(|package| is_package_name(package)) {
-        return String::new();
-    }
-    posix_command(&POSIX_INSTALL_LIBRARIES.replace("@PACKAGES@", &packages.join(" ")))
 }
 
 #[cfg(test)]
@@ -657,18 +441,15 @@ mod tests {
     #[test]
     fn reports() {
         let report = parse_report(
-            "noise\n FRIDAY-DEPLOY uname Linux x86_64\nFRIDAY-DEPLOY desktop no\nFRIDAY-DEPLOY managed 2.55.1\nFRIDAY-DEPLOY staged 2.56.0\nFRIDAY-DEPLOY staged 2.56.0\nFRIDAY-DEPLOY missing libfoo.so.1 libfoo1\nFRIDAY-DEPLOY missing libbar.so libfoo1\nFRIDAY-DEPLOY privilege sudo\nFRIDAY-DEPLOY pm apt-get\nFRIDAY-DEPLOY fail\n",
+            "noise\n FRIDAY-DEPLOY uname Linux x86_64\nFRIDAY-DEPLOY managed 2.55.1\nFRIDAY-DEPLOY serverhas 2.56.0\nFRIDAY-DEPLOY serverhas 2.56.0\nFRIDAY-DEPLOY server broken\nFRIDAY-DEPLOY fail\n",
         );
         assert_eq!((text(&report, "system"), text(&report, "machine"), text(&report, "managed")), ("Linux", "x86_64", "2.55.1"));
-        assert_eq!(report["staged"], json!(["2.56.0"]));
+        assert_eq!(report["serverVersions"], json!(["2.56.0"]));
+        assert_eq!(report["serverPackage"], "broken");
         assert_eq!(report["failure"], "unknown");
-        assert_eq!(report["missingPackages"], json!(["libfoo1"]));
-        assert_eq!(report["canInstallLibraries"], true);
-        assert_eq!(report["libraryCommand"], "sudo apt-get install -y libfoo1");
         assert!(manages_install(&report));
-        assert!(!uses_server_package(&json!({ "system": "Linux", "desktop": true, "managed": "" })));
-        assert!(uses_server_package(&json!({ "system": "Linux", "desktop": false, "managed": "broken" })));
-        assert!(uses_server_package(&json!({ "system": "Darwin" })));
+        assert!(!manages_install(&json!({ "system": "Linux", "systemInstall": "2.80.0" })));
+        assert!(!manages_install(&json!({ "system": "" })));
         assert_eq!(platform_key("Linux", "aarch64"), "linux-arm64");
         assert_eq!(platform_key("MINGW64_NT", "AMD64"), "windows-x64");
         assert_eq!(platform_key("FreeBSD", "x86_64"), "");
@@ -685,35 +466,33 @@ mod tests {
         assert!(!should_upgrade("2.55.0", "2.56.0", "2.55.0", false, false));
         assert!(!should_upgrade("2.55.0", "2.56.0", "0.0.0", true, false));
         assert!(should_upgrade("2.55.0", "2.56.0", "0.0.0", true, true));
-        assert!(is_package_name("libc6") && !is_package_name("Lib") && !is_package_name("a;b"));
         assert!(describe_failure("run GLIBC_2.39 not found").contains("glibc 2.35"));
     }
 
     #[test]
     fn manifests() {
         let manifest = json!({
-            "stable": { "tag": "v2.55.0", "assets": { "linux-x64": { "tarball": { "url": "https://x/Friday-v2.55.0-linux-x64.tar.gz", "sha256": "AB" },
-                "server": { "url": "https://x/s.tar.gz", "protocol": 3 } } } },
-            "beta": { "tag": "v2.56.0-beta", "remoteProtocol": 4, "assets": { "linux-x64": { "tarball": { "url": "https://x/b.tar.gz", "name": "b" } } } },
+            "stable": { "tag": "v2.55.0", "assets": { "linux-x64": { "tarball": { "url": "https://x/Friday-v2.55.0-linux-x64.tar.gz" },
+                "server": { "url": "https://x/Friday-v2.55.0-server-linux-x64.tar.gz", "sha256": "AB", "protocol": 3 } } } },
+            "beta": { "tag": "v2.56.0-beta", "assets": { "linux-x64": { "server": { "url": "https://x/b.tar.gz", "name": "b", "version": "2.56.1" } } } },
         });
-        let stable = from_manifest(&manifest, "stable", "linux-x64", false);
+        let stable = from_manifest(&manifest, "stable", "linux-x64");
         assert_eq!(
             (stable["version"].as_str(), stable["protocolVersion"].as_i64(), stable["sha256"].as_str()),
             (Some("2.55.0"), Some(3), Some("ab"))
         );
-        assert_eq!(stable["name"], "Friday-v2.55.0-linux-x64.tar.gz");
-        let beta = from_manifest(&manifest, "beta", "linux-x64", false);
-        assert_eq!((beta["version"].as_str(), beta["protocolVersion"].as_i64()), (Some("2.56.0"), Some(4)));
-        let server = from_manifest(&manifest, "beta", "linux-x64", true);
-        assert_eq!((server["version"].as_str(), server["server"].as_bool()), (Some("2.55.0"), Some(true)));
-        assert!(from_manifest(&manifest, "stable", "macos-arm64", false).is_null());
+        assert_eq!(stable["name"], "Friday-v2.55.0-server-linux-x64.tar.gz");
+        let beta = from_manifest(&manifest, "beta", "linux-x64");
+        assert_eq!((beta["version"].as_str(), beta["name"].as_str()), (Some("2.56.1"), Some("b")));
+        assert!(from_manifest(&manifest, "stable", "macos-arm64").is_null());
         let dir = std::env::temp_dir().join(format!("friday-deploy-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        for name in ["Friday-v2.55.0-linux-x64.tar.gz", "Friday-v2.56.0-beta-linux-x64.tar.gz", "Friday-v2.57.0-server-linux-x64.tar.gz"] {
+        for name in ["Friday-v2.58.0-linux-x64.tar.gz", "Friday-v2.56.0-beta-server-linux-x64.tar.gz", "Friday-v2.57.0-server-linux-x64.tar.gz"] {
             std::fs::write(dir.join(name), b"x").unwrap();
         }
-        assert_eq!(from_directory(&dir, "linux-x64", false, 9)["name"], "Friday-v2.56.0-beta-linux-x64.tar.gz");
-        assert_eq!(from_directory(&dir, "linux-x64", true, 9)["version"], "2.57.0");
+        let local = from_directory(&dir, "linux-x64", 9);
+        assert_eq!((local["version"].as_str(), local["protocolVersion"].as_i64()), (Some("2.57.0"), Some(9)));
+        assert!(from_directory(&dir, "windows-x64", 9).is_null());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -723,10 +502,10 @@ mod tests {
         assert!(
             inspect_command("powershell").starts_with("powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ")
         );
-        assert!(deploy_command("posix", "2.55.0", true, false, "").contains("v=\"2.55.0\""));
-        assert!(deploy_command("posix", "2.55.0; rm", true, false, "").is_empty());
-        assert!(install_libraries_command(&["libfoo1".into()]).contains("libfoo1"));
-        assert!(install_libraries_command(&["a;b".into()]).is_empty());
+        let posix = deploy_command("posix", "2.55.0", true, "2.54.0");
+        assert!(posix.contains("v=\"2.55.0\"; k=\"2.54.0\"") && posix.contains("\"1\" = 1"));
+        assert!(deploy_command("posix", "2.55.0; rm", true, "").is_empty());
+        assert!(deploy_command("posix", "2.55.0", false, "x").is_empty());
         assert_eq!(base64(b"hello"), "aGVsbG8=");
         assert_eq!(base64(b"hi"), "aGk=");
     }

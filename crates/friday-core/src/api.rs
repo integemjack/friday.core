@@ -488,11 +488,12 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
             let text = string(params, "text")?;
             Ok(json!({ "requirement": task_state::looks_like_requirement(&text), "rule": task_state::looks_like_rule(&text) }))
         }
-        // {path} → {entries, legacyDisabledKinds}（capabilities.json：三组提供方合在一起、旧版本按能力整体关掉的）
+        // {path} → {entries, legacyDisabledKinds, models}（capabilities.json：三组提供方合在一起、旧版本按能力整体关掉的、每项能力选的模型）
         "capabilities.loadConfig" => Ok(capability_store::load_config(std::path::Path::new(&string(params, "path")?))),
-        // {path, entries} → null | {failure}（按类型分三组写）
+        // {path, entries, models?} → null | {failure}（按类型分三组写；models 空的不写）
         "capabilities.saveConfig" => {
-            Ok(match capability_store::save_config(std::path::Path::new(&string(params, "path")?), &list(params, "entries")?) {
+            let models = params.get("models").cloned().unwrap_or(Value::Null);
+            Ok(match capability_store::save_config_with_models(std::path::Path::new(&string(params, "path")?), &list(params, "entries")?, &models) {
                 Ok(()) => Value::Null,
                 Err(failure) => json!({ "failure": failure }),
             })
@@ -506,22 +507,20 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
                 Err(failure) => json!({ "failure": failure }),
             })
         }
-        // {output} → 远程「FRIDAY-DEPLOY …」那几行解出的报告（含 missingPackages、canInstallLibraries、libraryCommand）
+        // {output} → 远程「FRIDAY-DEPLOY …」那几行解出的报告
         "deploy.parseReport" => Ok(deploy::parse_report(&string(params, "output")?)),
         // {system, machine} → 包的键（linux-x64…）或空
         "deploy.platformKey" => Ok(json!(deploy::platform_key(&string(params, "system")?, &string(params, "machine")?))),
-        // {manifest, channel: stable|beta, key, server?} → 要装的包或 null（latest.json）
+        // {manifest, channel: stable|beta, key} → 要装的服务端包或 null（latest.json 的 assets[键].server）
         "deploy.fromManifest" => Ok(deploy::from_manifest(
             params.get("manifest").unwrap_or(&Value::Null),
             &string(params, "channel")?,
             &string(params, "key")?,
-            flag(params, "server"),
         )),
-        // {directory, key, server?, protocol} → 目录里的包或 null
+        // {directory, key, protocol} → 目录里的服务端包或 null
         "deploy.fromDirectory" => Ok(deploy::from_directory(
             std::path::Path::new(&string(params, "directory")?),
             &string(params, "key")?,
-            flag(params, "server"),
             params.get("protocol").and_then(Value::as_i64).unwrap_or(0),
         )),
         // {a, b} → -1 / 0 / 1
@@ -536,30 +535,24 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
             flag(params, "clientIsDevelopment"),
             flag(params, "localPackages")
         ))),
-        // {report} → {managesInstall, usesServerPackage}
+        // {report} → {managesInstall}
         "deploy.decide" => {
             let report = params.get("report").cloned().unwrap_or(Value::Null);
-            Ok(json!({ "managesInstall": deploy::manages_install(&report), "usesServerPackage": deploy::uses_server_package(&report) }))
+            Ok(json!({ "managesInstall": deploy::manages_install(&report) }))
         }
-        // {text} → {version, packageName}（能不能拼进远程命令）
-        "deploy.checkText" => {
-            let text = string(params, "text")?;
-            Ok(json!({ "version": deploy::is_version_text(&text), "packageName": deploy::is_package_name(&text) }))
-        }
+        // {text} → {version}（能不能拼进远程命令）
+        "deploy.checkText" => Ok(json!({ "version": deploy::is_version_text(&string(params, "text")?) })),
         // {failure} → 失败原因的说法
         "deploy.describeFailure" => Ok(json!(deploy::describe_failure(&string(params, "failure")?))),
         // {shell: posix|powershell} → 看远程装了什么的命令
         "deploy.inspectCommand" => Ok(json!(deploy::inspect_command(&string(params, "shell")?))),
-        // {shell, version, upload, server?, keep?} → 装 / 换上的命令（版本号不对时为空）
+        // {shell, version, upload, keep?} → 装 / 换上服务端包的命令（版本号不对时为空）
         "deploy.deployCommand" => Ok(json!(deploy::deploy_command(
             &string(params, "shell")?,
             &string(params, "version")?,
             flag(params, "upload"),
-            flag(params, "server"),
             params.get("keep").and_then(Value::as_str).unwrap_or("")
         ))),
-        // {packages} → 用 apt-get 装系统库的命令（包名不对时为空）
-        "deploy.installLibrariesCommand" => Ok(json!(deploy::install_libraries_command(&string_list(params, "packages")?))),
         // {id} → 提供方 id 合不合法
         "providers.isValidID" => Ok(json!(provider_store::is_valid_id(&string(params, "id")?))),
         // {manifest} → 补默认值的清单 | {failure}（provider.json）
@@ -649,8 +642,9 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
             std::path::Path::new(&string(params, "workDirectory")?),
             std::path::Path::new(&string(params, "home")?)
         ))),
-        // {name, command?, path?, alwaysConfirm, paid, mode: auto|plan|full, permissionNeedsApproval, stopsSystem, browserStop, powerShell?}
-        //   → {needed, forced}（一个调用要不要先问用户；powerShell 不传按这台是不是 Windows）
+        // {name, command?, path?, alwaysConfirm, paid, mode: auto|plan|full, permissionNeedsApproval, stopsSystem, browserStop, powerShell?,
+        //  ownDeletions?} → {needed, forced}（一个调用要不要先问用户；powerShell 不传按这台是不是 Windows；ownDeletions：删的全是这段对话
+        //  自己新建的，不算删除类）
         "approval.decide" => {
             let text = |key: &str| params.get(key).and_then(Value::as_str).map(str::to_string);
             let (name, command, path, mode) =
@@ -666,6 +660,7 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
                 stops_system: flag(params, "stopsSystem"),
                 browser_stop: flag(params, "browserStop"),
                 power_shell: params.get("powerShell").and_then(Value::as_bool).unwrap_or(cfg!(windows)),
+                own_deletions: flag(params, "ownDeletions"),
             };
             let (needed, forced) = approval::decide(&request);
             Ok(json!({ "needed": needed, "forced": forced }))
@@ -1118,11 +1113,14 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
             let limit = int(params, "limit")?;
             Ok(json!({ "reserve": context::reserve(limit), "threshold": context::threshold(limit), "target": context::target(limit) }))
         }
-        // {history, folded, budget, summaries?: {echoesReasoning, taskStateTool, wholeTools}}
-        //   → {shortened, dropped, before, after, folded, history?}（压了才带 history；summaries 不给用默认的摘要）
+        // {history, folded | marks, budget, summaries?: {echoesReasoning, taskStateTool, wholeTools}}
+        //   → {shortened, dropped, before, after, folded, marks, history?}（压了才带 history；summaries 不给用默认的摘要）
         "context.compact" => {
             let mut history = list(params, "history")?;
-            let mut folded = usize::try_from(int(params, "folded")?).map_err(|_| ApiError::invalid("folded 不能是负数"))?;
+            let mut folded = match params.get("marks") {
+                Some(_) => 0,
+                None => usize::try_from(int(params, "folded")?).map_err(|_| ApiError::invalid("folded 不能是负数"))?,
+            };
             let summaries = match params.get("summaries") {
                 Some(Value::Object(summaries)) => Some(context::Summaries {
                     echoes_reasoning: summaries.get("echoesReasoning").and_then(Value::as_bool).unwrap_or(false),
@@ -1130,9 +1128,16 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
                 }),
                 _ => None,
             };
-            let result = context::compact(&mut history, &mut folded, int(params, "budget")?, summaries.as_ref());
+            // v2.86 marks：调用方记的几个位置（折到哪、这一轮从哪起……），去掉前面的消息时一起挪；给了就不看 folded
+            let mut marks: Vec<usize> = match params.get("marks") {
+                Some(Value::Array(items)) => items.iter().map(|item| item.as_u64().unwrap_or(0) as usize).collect(),
+                _ => vec![folded],
+            };
+            let result = context::compact_marks(&mut history, &mut marks, int(params, "budget")?, summaries.as_ref());
+            folded = marks.first().copied().unwrap_or(folded);
             let mut out = json!({
                 "shortened": result.shortened, "dropped": result.dropped, "before": result.before, "after": result.after, "folded": folded,
+                "marks": marks,
             });
             if result.shortened > 0 || result.dropped > 0 {
                 out["history"] = Value::Array(history);
@@ -1847,6 +1852,36 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
             }
             Ok(result)
         }
+        // {history, start, folded, dropped, foldedBudget, turn?, override?}（v2.86 一次运行里折过的步骤的上限；turn：主智能体这一轮是第几轮，
+        //   说明写「用 read_history 看第几轮」，没有是子智能体）→ {steps, total, after, folded, dropped, history?}（去掉了才带 history）
+        "fold.trim" => {
+            let mut history = list(params, "history")?;
+            let index = |key: &str| -> Result<usize, ApiError> {
+                usize::try_from(int(params, key)?).map_err(|_| ApiError::invalid(format!("{key} 不能是负数")))
+            };
+            let start = index("start")?;
+            let mut folded = index("folded")?;
+            let mut dropped = index("dropped")?;
+            let turn = params.get("turn").and_then(Value::as_i64);
+            let override_id = override_id(params);
+            let note = move |count: usize| {
+                let mut args = prompts::Args::new();
+                args.insert("count".into(), count.to_string());
+                match turn {
+                    Some(turn) => {
+                        args.insert("turn".into(), turn.to_string());
+                        prompts::text("context-fold.dropped-steps", &args, override_id)
+                    }
+                    None => prompts::text("context-fold.dropped-steps.sub", &args, override_id),
+                }
+            };
+            let trimmed = folding::trim(&mut history, start, &mut folded, &mut dropped, int(params, "foldedBudget")?, &note);
+            let mut result = json!({ "steps": trimmed.steps, "total": trimmed.total, "after": trimmed.after, "folded": folded, "dropped": dropped });
+            if trimmed.steps > 0 {
+                result["history"] = Value::Array(history);
+            }
+            Ok(result)
+        }
 
         _ => Err(ApiError { code: "unknownMethod", message: format!("没有这个方法：{method}") }),
     }
@@ -2235,6 +2270,39 @@ mod tests {
         assert!(result["result"].get("history").is_none());
         params["folded"] = json!(-1);
         assert_eq!(parsed("fold.session", &params.to_string())["error"]["code"], json!("invalidParams"));
+    }
+
+    /// Friday v2.86：一次运行里折过的步骤的上限（fold.trim）、压历史时几个位置一起挪（context.compact 的 marks）
+    #[test]
+    fn trim_and_marks() {
+        let step = |n: usize| {
+            vec![
+                json!({ "role": "assistant", "content": format!("第 {n} 步"),
+                    "tool_calls": [{ "id": format!("c{n}"), "type": "function", "function": { "name": "run_shell", "arguments": "{}" } }] }),
+                json!({ "role": "tool", "tool_call_id": format!("c{n}"), "name": "run_shell", "content": "出".repeat(600) }),
+            ]
+        };
+        let mut history = vec![json!({ "role": "user", "content": "任务" })];
+        for n in 0..10 {
+            history.extend(step(n));
+        }
+        let folded = history.len() - 2;
+        let params = json!({ "history": history, "start": 1, "folded": folded, "dropped": 0, "foldedBudget": 1_000 });
+        let result = &parsed("fold.trim", &params.to_string())["result"];
+        let steps = result["steps"].as_u64().unwrap();
+        assert!(steps > 0 && result["dropped"] == json!(steps), "{result}");
+        let trimmed = result["history"].as_array().unwrap();
+        assert!(trimmed.len() < history.len() && trimmed[0]["content"] == json!("任务"));
+        assert!(result["folded"].as_u64().unwrap() < folded as u64);
+        assert_eq!(trimmed.last(), history.last(), "最新的一步不动");
+        let params = json!({ "history": history, "start": 1, "folded": folded, "dropped": 0, "foldedBudget": 0 });
+        assert_eq!(parsed("fold.trim", &params.to_string())["result"]["steps"], json!(0), "没上限不去");
+        let params = json!({ "history": history, "marks": [folded, 5], "budget": 500 });
+        let compacted = &parsed("context.compact", &params.to_string())["result"];
+        let marks = compacted["marks"].as_array().unwrap();
+        assert_eq!(marks.len(), 2);
+        assert_eq!(compacted["folded"], marks[0]);
+        assert!(compacted["dropped"].as_u64().unwrap() > 0 && marks[0].as_u64().unwrap() < folded as u64, "{compacted}");
     }
 
     #[test]

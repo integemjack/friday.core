@@ -50,7 +50,22 @@
 | 4 | 会话存储：落盘（核心留一份存档，两端只交改过的会话和顺序，核心在后台拼整份写；空白不写、只剩草稿的写；序号防先后乱；落盘间隔按编码耗时）、fork 新会话的拼法；增删改、防抖计时、界面观察的数组、正在生成的那条、搜索留在两端 | `Models/ConversationStore.swift`；`models/ConversationStore.cpp` | 完成（`archive.*`、`conversations.fork`；以前每次落盘编码整份存档，现在只编码改过的几段，没改的照核心读入时留着的写，两端认不出的字段也不丢；fork 带上任务模式（Swift 原来没带，按 Qt）；Qt 的落盘间隔原来固定 3 秒，现在和 Swift 一样按耗时放大；搜索要 Unicode 的分解和大小写折叠表，两端系统自带，核心没有这类依赖，留在两端） |
 | 4 | 引擎的对话循环（历史、收尾、按会话折叠、本地大模型压历史、超长重发、统计、复读处理、截断续写、工具结果和截图、说了没做的提醒） | `LLM/Engine/OpenAIChatEngine.swift` 的 run；`llm/engine/OpenAIChatEngine.cpp` | 完成（`loop.*` 句柄，两端只照着执行：发 HTTP、跑工具、问本机上限；参数不是合法 JSON 的工具调用历史里记 "{}"（Qt 原来的做法））；v2.86 同 Friday：已折叠步骤的上限（`folding::trim`，设置 `foldedBudget` / `historyTurn`，`prepare` 回 `trimmed`）、在线模型按已知上限（超长报错里的、服务商报的）先压、被说超长压完重发一次、在线也校准、`loop.appended` 拿这个循环接上的原样消息 |
 | 4 | 智能体循环里两端共有的规则：审批（删除类、系统改动、按权限模式；Windows 上再认 PowerShell / cmd 的删除命令）、看门狗（期限、卡住、原地打转、被停时的说明和建议、做到一半的结果）、交付检查和写完没验证、任务状态、子智能体（参数、起名、角色、用哪个大脑、按活挑模型和思考档位、太长结果的截断）、工作流（计划校验、按依赖推进、交回的文字）、团队调度（原样重派 / 重复派 / 原样往下传的检查、汇报的写法、在整个任务里的位置）、运行记录 | `Agent/AgentRunner.swift`、`SubAgentRunner.swift`、`Workflow.swift`、`AgentTeamControl.swift`、`AgentLiveness`、`DeliveryCheck`、`TurnCheck`、`TaskState`、`ModelChooser`；`agent/` | 完成（`approval.*`、`agents.*`、`workflow.*`、`team.*`、`delivery.*`、`turnCheck.*`、`agentLog.*`、`taskState.*`、`models.pick` 等；一轮怎么排、跑子智能体、团队状态、界面上的卡片、自动恢复的重试循环、钩子、命令留在两端——它们是执行和状态，绑着两端的线程、观察对象和任务取消） |
-| 5 | 远程：两端客户端共有的部署规则（远程脚本只留一份、报告解析、包的键、从 latest.json / 本地目录挑包、版本比较、该不该升级、装服务端包还是桌面端、失败原因） | Swift `Remote/RemoteDeploy.swift`；Qt `remote/RemoteDeploy` | 完成（`deploy.*`）。服务端的方法分派（RemoteServer）直接读写 Qt 里的会话、智能体、终端、浏览器这些对象，Swift 只做控制端（v2.52）、没有第二份，留在 Qt；增量消息（MessagePatch：每 80 毫秒比一次整条消息）和 WebRTC 工作通道的分帧是热路径，经 JSON 过 C 接口要每次编码整条消息 / 二进制分片，留在两端；客户端那边远程设置的代理（RemoteConfig 等）是对象映射，留在两端 |
+| 5 | 远程：两端客户端共有的部署规则（远程脚本只留一份、报告解析、包的键、从 latest.json / 本地目录挑服务端包、版本比较、该不该升级、客户端能不能管这台的安装、失败原因） | Swift `Remote/RemoteDeploy.swift`；Qt `remote/RemoteDeploy` | 完成（`deploy.*`；Friday v2.87 起一律装服务端包，装桌面端、替用户装缺的系统库那套去掉了）。服务端的方法分派（RemoteServer）直接读写 Qt 里的会话、智能体、终端、浏览器这些对象，Swift 只做控制端（v2.52）、没有第二份，留在 Qt；增量消息（MessagePatch：每 80 毫秒比一次整条消息）和 WebRTC 工作通道的分帧是热路径，经 JSON 过 C 接口要每次编码整条消息 / 二进制分片，留在两端；客户端那边远程设置的代理（RemoteConfig 等）是对象映射，留在两端；v2.83 装 EDITH（RemoteEdith）的脚本和挑包先留在两端 |
+
+## 和 Friday v2.80–v2.97 合并时留在两端的（2026-11-04）
+
+v2.79 分支合进 main 时，main 这段时间在两端加的规则多数已经补进核心：对话循环里 v2.86 的已折叠步骤上限（`folding::trim`，另有 `fold.trim`
+给两端的调试 / 自检直接调）、在线模型按已知上限先压和超长重发、`context.compact` 的 marks；v2.96 看图（一步最多附 4 张、跨步只留 2 张、
+标记「［工具图片］」）、capabilities.json 的 models；v2.84 审批的 `ownDeletions`；v2.87 部署只装服务端包。下面这些是 main 新加的模块，
+两端各一份，还没搬：
+
+| 内容 | 两端的位置 |
+|---|---|
+| 主会话折叠分级（摘要 / 骨架 / 整轮省略、最近一轮按步折，v2.86）和 read_history | Swift `Agent/ContextFolding.swift`、`HistoryTool.swift`；Qt `agent/ContextFolding.cpp`、`HistoryTool.cpp` |
+| 工具按需加载（v2.80 / v2.81）、发给模型的工具合并（v2.90）、少给的几个工具（v2.92） | `Agent/DeferredTools.swift`、`ToolMerge.swift`；`agent/DeferredTools.cpp`、`ToolMerge.cpp` |
+| 这段对话自己新建的文件（OwnFiles，v2.84）：命令解析、记账；审批只收结果 | `Agent/OwnFiles.swift`；`agent/OwnFiles.cpp` |
+| 工具给模型的图（ModelImages：read_file 的图片、MCP 返回的图，v2.96）的收集和说明文字 | `Agent/ModelImages.swift`；`util/ModelImages.cpp` |
+| 装 EDITH 和 edith-friday（RemoteEdith，v2.83） | `Remote/RemoteEdith.swift`；`remote/RemoteEdith.cpp` |
 
 **会话存储本身（ConversationStore：增删改、分叉、落盘的防抖）和智能体循环一起搬（第 4 阶段）**：流式生成时每个字都改一次正在写的消息，
 存储先搬进核心的话每个字都要过一次 C 接口。第 2 阶段先把数据模型和读入规整搬过来，两端照旧在内存里改、自己落盘。

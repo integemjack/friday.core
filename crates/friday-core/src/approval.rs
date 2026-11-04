@@ -135,6 +135,8 @@ pub struct Request<'a> {
     /// 浏览器里要停下来的操作（两端判断）
     pub browser_stop: bool,
     pub power_shell: bool,
+    /// Friday v2.84 run_shell 删的全是这段对话自己新建的（两端的 OwnFiles 判断）：不算删除类，自动 / 计划模式不用问
+    pub own_deletions: bool,
 }
 
 /// 返回 (needed, forced)
@@ -146,7 +148,7 @@ pub fn decide(request: &Request) -> (bool, bool) {
         return (false, false);
     }
     let stop = (request.stops_system && is_system_change(request.name, request.command, request.path)) || request.browser_stop;
-    let destructive = is_destructive(request.name, request.command, request.power_shell);
+    let destructive = !request.own_deletions && is_destructive(request.name, request.command, request.power_shell);
     let needed = match request.mode {
         "plan" => request.permission_needs_approval || destructive || stop,
         _ => destructive || stop,
@@ -202,10 +204,13 @@ mod tests {
             stops_system: true,
             browser_stop: false,
             power_shell: false,
+            own_deletions: false,
         };
         assert_eq!(decide(&base), (false, false));
         assert_eq!(decide(&Request { mode: "plan", ..base }), (true, false));
         assert_eq!(decide(&Request { command: Some("rm x"), ..base }), (true, false));
+        assert_eq!(decide(&Request { command: Some("rm x"), own_deletions: true, ..base }), (false, false), "删的全是自己新建的不问");
+        assert_eq!(decide(&Request { command: Some("rm x"), own_deletions: true, mode: "plan", ..base }), (true, false), "计划模式照旧按权限问");
         assert_eq!(decide(&Request { command: Some("sudo apt install x"), ..base }), (true, true));
         assert_eq!(decide(&Request { command: Some("sudo apt install x"), stops_system: false, ..base }), (false, false));
         assert_eq!(decide(&Request { command: Some("rm x"), mode: "full", ..base }), (false, false));
