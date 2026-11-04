@@ -493,10 +493,16 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
         // {path, entries, models?} → null | {failure}（按类型分三组写；models 空的不写）
         "capabilities.saveConfig" => {
             let models = params.get("models").cloned().unwrap_or(Value::Null);
-            Ok(match capability_store::save_config_with_models(std::path::Path::new(&string(params, "path")?), &list(params, "entries")?, &models) {
-                Ok(()) => Value::Null,
-                Err(failure) => json!({ "failure": failure }),
-            })
+            Ok(
+                match capability_store::save_config_with_models(
+                    std::path::Path::new(&string(params, "path")?),
+                    &list(params, "entries")?,
+                    &models,
+                ) {
+                    Ok(()) => Value::Null,
+                    Err(failure) => json!({ "failure": failure }),
+                },
+            )
         }
         // {path} → [任务]（jobs.json）
         "capabilities.loadJobs" => Ok(json!(capability_store::load_jobs(std::path::Path::new(&string(params, "path")?)))),
@@ -512,11 +518,9 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
         // {system, machine} → 包的键（linux-x64…）或空
         "deploy.platformKey" => Ok(json!(deploy::platform_key(&string(params, "system")?, &string(params, "machine")?))),
         // {manifest, channel: stable|beta, key} → 要装的服务端包或 null（latest.json 的 assets[键].server）
-        "deploy.fromManifest" => Ok(deploy::from_manifest(
-            params.get("manifest").unwrap_or(&Value::Null),
-            &string(params, "channel")?,
-            &string(params, "key")?,
-        )),
+        "deploy.fromManifest" => {
+            Ok(deploy::from_manifest(params.get("manifest").unwrap_or(&Value::Null), &string(params, "channel")?, &string(params, "key")?))
+        }
         // {directory, key, protocol} → 目录里的服务端包或 null
         "deploy.fromDirectory" => Ok(deploy::from_directory(
             std::path::Path::new(&string(params, "directory")?),
@@ -1876,7 +1880,8 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
                 }
             };
             let trimmed = folding::trim(&mut history, start, &mut folded, &mut dropped, int(params, "foldedBudget")?, &note);
-            let mut result = json!({ "steps": trimmed.steps, "total": trimmed.total, "after": trimmed.after, "folded": folded, "dropped": dropped });
+            let mut result =
+                json!({ "steps": trimmed.steps, "total": trimmed.total, "after": trimmed.after, "folded": folded, "dropped": dropped });
             if trimmed.steps > 0 {
                 result["history"] = Value::Array(history);
             }

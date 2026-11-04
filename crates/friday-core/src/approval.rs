@@ -210,7 +210,11 @@ mod tests {
         assert_eq!(decide(&Request { mode: "plan", ..base }), (true, false));
         assert_eq!(decide(&Request { command: Some("rm x"), ..base }), (true, false));
         assert_eq!(decide(&Request { command: Some("rm x"), own_deletions: true, ..base }), (false, false), "删的全是自己新建的不问");
-        assert_eq!(decide(&Request { command: Some("rm x"), own_deletions: true, mode: "plan", ..base }), (true, false), "计划模式照旧按权限问");
+        assert_eq!(
+            decide(&Request { command: Some("rm x"), own_deletions: true, mode: "plan", ..base }),
+            (true, false),
+            "计划模式照旧按权限问"
+        );
         assert_eq!(decide(&Request { command: Some("sudo apt install x"), ..base }), (true, true));
         assert_eq!(decide(&Request { command: Some("sudo apt install x"), stops_system: false, ..base }), (false, false));
         assert_eq!(decide(&Request { command: Some("rm x"), mode: "full", ..base }), (false, false));

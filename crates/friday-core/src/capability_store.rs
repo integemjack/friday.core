@@ -100,7 +100,10 @@ mod tests {
         save_config_with_models(&path, &entries, &json!({ "image": "qwen|wanx" })).unwrap();
         assert_eq!(load_config(&path)["models"], json!({ "image": "qwen|wanx" }));
         std::fs::write(&path, r#"{"entries":[{"id":"x","type":"old"},3],"disabledKinds":["video"],"models":{"image":1}}"#).unwrap();
-        assert_eq!(load_config(&path), json!({ "entries": [{ "id": "x", "type": "old" }], "legacyDisabledKinds": ["video"], "models": {} }));
+        assert_eq!(
+            load_config(&path),
+            json!({ "entries": [{ "id": "x", "type": "old" }], "legacyDisabledKinds": ["video"], "models": {} })
+        );
         let jobs: Vec<Value> = (0..60).map(|index| json!({ "id": index })).collect();
         let jobs_path = dir.join("jobs.json");
         save_jobs(&jobs_path, &jobs).unwrap();

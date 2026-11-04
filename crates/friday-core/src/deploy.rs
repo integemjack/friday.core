@@ -487,7 +487,9 @@ mod tests {
         assert!(from_manifest(&manifest, "stable", "macos-arm64").is_null());
         let dir = std::env::temp_dir().join(format!("friday-deploy-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        for name in ["Friday-v2.58.0-linux-x64.tar.gz", "Friday-v2.56.0-beta-server-linux-x64.tar.gz", "Friday-v2.57.0-server-linux-x64.tar.gz"] {
+        for name in
+            ["Friday-v2.58.0-linux-x64.tar.gz", "Friday-v2.56.0-beta-server-linux-x64.tar.gz", "Friday-v2.57.0-server-linux-x64.tar.gz"]
+        {
             std::fs::write(dir.join(name), b"x").unwrap();
         }
         let local = from_directory(&dir, "linux-x64", 9);
