@@ -53,7 +53,7 @@ pub fn hint(command: &str, conversation: &str) -> String {
     };
     let seconds = number(&SLEEP).or_else(|| number(&SLEEP_MS).map(|ms| ms / 1000)).or_else(|| number(&TIMEOUT)).unwrap_or(0);
     if seconds >= 30 {
-        return "\n（提示：固定 sleep 干等不划算——要等的命令直接用 run_shell 跑到结束（timeout_seconds 最多 600），或者 run_in_terminal 开着、read_terminal 带 wait_for 等它打出某句话）".into();
+        return "\n（提示：固定 sleep 干等不划算——一两分钟的命令直接用 run_shell 跑到结束（timeout_seconds 最多 600）；更久的用 run_in_terminal 开着，它跑完、打出 ::friday:: 标记行或匹配 notify_on 的行时会主动告诉你）".into();
     }
     const VIEWERS: [&str; 15] = [
         "cat",

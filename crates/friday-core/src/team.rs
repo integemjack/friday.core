@@ -102,7 +102,8 @@ pub fn message_note(from: Option<&str>) -> String {
     }
 }
 
-/// 汇报 / 完成通知交给父级的文字。kind：report / finished / failed / stopped / workflow
+/// 汇报 / 完成通知交给父级的文字。kind：report / finished / failed / stopped / workflow / command / commandFinished
+/// （v2.88 run_in_terminal 开的命令主动发来的：name 是终端标题、id 是终端 id）
 pub fn notice_text(kind: &str, name: &str, id: &str, text: &str) -> String {
     let who = format!("子 Agent「{name}」（id：{}）", short_id(id));
     match kind {
@@ -110,6 +111,8 @@ pub fn notice_text(kind: &str, name: &str, id: &str, text: &str) -> String {
         "finished" => format!("[{who}完成了]\n{text}"),
         "failed" => format!("[{who}失败了]\n{text}"),
         "workflow" => format!("[工作流（id：{}）的步骤全部结束了，等你验收]\n{text}", short_id(id)),
+        "command" => format!("[终端 {}「{name}」里的命令发来消息，它还在跑]\n{text}", short_id(id)),
+        "commandFinished" => format!("[终端 {}「{name}」里的命令跑完了]\n{text}", short_id(id)),
         // 「[子 Agent「X」被用户停止了，没做完。]」+ 做到一半的结果 + 建议
         _ => {
             let (first, rest) = text.split_once('\n').unwrap_or((text, ""));
@@ -247,6 +250,11 @@ mod tests {
     fn texts() {
         assert_eq!(message_note(Some("组长")), "（组长在你工作时追加了下面的指示：和你的任务一起考虑，有冲突以它为准。）\n");
         assert_eq!(notice_text("finished", "甲", "ABCDEF123", "好了"), "[子 Agent「甲」（id：abcdef12）完成了]\n好了");
+        assert_eq!(
+            notice_text("command", "构建", "ABCDEF123", "第 3 步好了"),
+            "[终端 abcdef12「构建」里的命令发来消息，它还在跑]\n第 3 步好了"
+        );
+        assert_eq!(notice_text("commandFinished", "构建", "ABCDEF123", "退出码 0"), "[终端 abcdef12「构建」里的命令跑完了]\n退出码 0");
         let stopped = notice_text("stopped", "甲", "ABCDEF123", "被用户停止了，没做完。\n\n做到一半的结果");
         assert!(stopped.starts_with("[子 Agent「甲」（id：abcdef12）被用户停止了，没做完。]\n做到一半的结果\n不要重新派发"));
         let chain = vec![

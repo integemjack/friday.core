@@ -197,7 +197,14 @@ pub fn builtins(args: &Args, override_id: Option<u64>) -> Vec<Builtin> {
                 ("wait_seconds", "integer", false),
             ],
         ),
-        make("run_in_terminal", "在终端里运行", "terminal", "execute", &[("command", "string", true)]),
+        // v2.88 命令主动发消息：跑完 / ::friday:: 标记行（notify，默认开）、匹配的行（notify_on）
+        make(
+            "run_in_terminal",
+            "在终端里运行",
+            "terminal",
+            "execute",
+            &[("command", "string", true), ("notify", "boolean", false), ("notify_on", "string", false)],
+        ),
         // v2.49 关掉 run_in_terminal 开的终端（只关智能体自己开的，停的也是它自己起的命令）
         make("close_terminal", "关闭终端", "terminal", "readOnly", &[("terminal", "string", true)]),
         // v2.12 内置浏览器：用户界面上这段对话的浏览器卡片
