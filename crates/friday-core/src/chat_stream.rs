@@ -83,6 +83,11 @@ impl Parser {
         Parser { show_reasoning, quota, ..Parser::default() }
     }
 
+    /// 走 Responses 接口的要给引擎：加密思考按它记（见 `responses`）
+    pub fn for_engine(show_reasoning: bool, quota: bool, engine_id: &str) -> Self {
+        Parser { engine_id: engine_id.to_string(), ..Parser::new(show_reasoning, quota) }
+    }
+
     /// 处理一个 chunk（SSE data: 的负载）
     pub fn feed(&mut self, chunk: &Value, now: DateTime<Utc>) -> Feed {
         let Some(kind) = responses::event_type(chunk) else { return self.feed_chat(chunk, now) };
@@ -399,8 +404,7 @@ static NEXT: AtomicU64 = AtomicU64::new(1);
 
 pub fn open(show_reasoning: bool, quota: bool, engine_id: &str) -> u64 {
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
-    let parser = Parser { engine_id: engine_id.to_string(), ..Parser::new(show_reasoning, quota) };
-    PARSERS.lock().unwrap().insert(id, Arc::new(Mutex::new(parser)));
+    PARSERS.lock().unwrap().insert(id, Arc::new(Mutex::new(Parser::for_engine(show_reasoning, quota, engine_id))));
     id
 }
 
@@ -528,7 +532,7 @@ mod tests {
 
     #[test]
     fn responses_stream() {
-        let mut parser = Parser { engine_id: "t-stream".into(), ..Parser::new(true, true) };
+        let mut parser = Parser::for_engine(true, true, "t-stream");
         assert_eq!(feed(&mut parser, r#"{"type":"response.created","response":{"id":"r"}}"#), Feed::default());
         let first = feed(&mut parser, r#"{"type":"response.reasoning_summary_text.delta","delta":"想一想"}"#);
         assert_eq!((first.chunks, first.first_token), (vec!["<think>".to_string(), "想一想".to_string()], true));

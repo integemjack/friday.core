@@ -1047,7 +1047,7 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
         "chat.unsupportedParameters" => {
             Ok(Value::from(chat_request::unsupported_parameters(int(params, "status")?, &string(params, "text")?)))
         }
-        // {status, text, body, engineID} → {body, responses} | null（请求被打回来了：改好的请求体，responses 是要换到 Responses 接口；null 照常报错）
+        // {status, text, body, engineID} → {body, responses, dropped?} | null（请求被打回来了：改好的请求体，responses 是要换到 Responses 接口；null 照常报错）
         "chat.refused" => {
             let body = params.get("body").unwrap_or(&Value::Null);
             Ok(chat_request::refused(int(params, "status")?, &string(params, "text")?, body, &string(params, "engineID")?)

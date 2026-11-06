@@ -180,7 +180,7 @@ pub fn wants_responses(status: i64, text: &str) -> bool {
 }
 
 /// 这个请求被 400 / 422 打回来了，能改的改了再发：报错叫改用 Responses 接口的换过去（记在引擎上，`responses: true`，两端换地址），
-/// 说不接受哪些可选参数的去掉（也记在引擎上）。返回 `{body, responses}`；改不了（请求里已经没有这些、已经是 Responses）返回 None，照常报错
+/// 说不接受哪些可选参数的去掉（也记在引擎上，`dropped` 是去掉的名字）。返回 `{body, responses, dropped?}`；改不了（请求里已经没有这些、已经是 Responses）返回 None，照常报错
 pub fn refused(status: i64, text: &str, body: &Value, engine_id: &str) -> Option<Value> {
     let chat = body.get("messages").is_some();
     if chat && wants_responses(status, text) {
@@ -207,7 +207,7 @@ pub fn refused(status: i64, text: &str, body: &Value, engine_id: &str) -> Option
         return None;
     }
     remember_unsupported(engine_id, &dropped);
-    Some(json!({ "body": changed, "responses": false }))
+    Some(json!({ "body": changed, "responses": false, "dropped": dropped }))
 }
 
 /// 单独点了这个名字（== `(?<![\w.])name(?![\w])`：前面不是字或点，后面不是字）
