@@ -3,6 +3,8 @@
 //! 网络和 SSE 分行留在两端（URLSession / Qt 走系统代理）：两端认出 `data:` 行、`[DONE]`，把每个 chunk 的 JSON 交给这里的句柄，
 //! 拿回这一块要交给界面的文字（思考包成 `<think>…</think>`）和该不该停；读完再取整段的结果（正文、思考、拼好的工具调用、用量、
 //! 结束原因、复读）。流里的报错（额度用完、限流、其他）也在这里认，两端照原样抛各自的错误。
+//!
+//! Responses 接口（见 `responses`）的流事件不一样，这里先翻成 chat/completions 的 chunk 再走同一条路，两端不用分。
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,6 +15,7 @@ use serde_json::{Map, Value, json};
 
 use crate::quota::{self, Limit};
 use crate::repetition::{self, Loop};
+use crate::responses;
 
 /// 一个拼到现在的工具调用
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -44,6 +47,8 @@ pub struct Feed {
     pub first_token: bool,
     /// 读到复读了，不再往下读
     pub looped: bool,
+    /// Responses 流的结束事件（等于 [DONE]）
+    pub done: bool,
     pub error: Option<StreamError>,
 }
 
@@ -67,6 +72,10 @@ pub struct Parser {
     finish_reason: Option<String>,
     first_token: bool,
     found: Option<(Loop, bool)>,
+    /// 这一段请求的引擎（Responses 的加密思考按它记）
+    engine_id: String,
+    /// Responses：下一个工具调用前面的加密思考
+    reasoning_items: Vec<Value>,
 }
 
 impl Parser {
@@ -74,8 +83,91 @@ impl Parser {
         Parser { show_reasoning, quota, ..Parser::default() }
     }
 
-    /// 处理一个 chunk（SSE data: 的负载）：usage → error.message → choices[0] 的 finish_reason 与 delta
+    /// 处理一个 chunk（SSE data: 的负载）
     pub fn feed(&mut self, chunk: &Value, now: DateTime<Utc>) -> Feed {
+        let Some(kind) = responses::event_type(chunk) else { return self.feed_chat(chunk, now) };
+        let done = matches!(kind, "response.completed" | "response.incomplete");
+        let mut feed = match self.responses_chunk(kind, chunk) {
+            Some(translated) => self.feed_chat(&translated, now),
+            None => Feed::default(),
+        };
+        feed.done = done;
+        feed
+    }
+
+    /// Responses 的事件翻成 chat/completions 的 chunk；没有要交给后面的返回 None
+    fn responses_chunk(&mut self, kind: &str, event: &Value) -> Option<Value> {
+        let text = || event.get("delta").and_then(Value::as_str);
+        let delta = |delta: Value| json!({ "choices": [{ "delta": delta }] });
+        let index = event.get("output_index").and_then(as_int).or_else(|| self.pending.keys().next_back().copied()).unwrap_or(0);
+        match kind {
+            "response.output_text.delta" | "response.refusal.delta" => Some(delta(json!({ "content": text()? }))),
+            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                Some(delta(json!({ "reasoning_content": text()? })))
+            }
+            // 思考摘要一段一段的：段之间空一行
+            "response.reasoning_summary_part.added" => {
+                (event.get("summary_index").and_then(as_int).unwrap_or(0) > 0).then(|| delta(json!({ "reasoning_content": "\n\n" })))
+            }
+            "response.function_call_arguments.delta" => {
+                Some(delta(json!({ "tool_calls": [{ "index": index, "function": { "arguments": text()? } }] })))
+            }
+            "response.output_item.added" | "response.output_item.done" => self.responses_item(index, event.get("item")?.as_object()?),
+            "response.completed" | "response.incomplete" => {
+                let response = event.get("response")?.as_object()?;
+                let reason = match response.get("incomplete_details").and_then(|details| details.get("reason")).and_then(Value::as_str) {
+                    Some("max_output_tokens") => "length",
+                    Some(reason) => reason,
+                    None if self.pending.is_empty() => "stop",
+                    None => "tool_calls",
+                };
+                let mut chunk = json!({ "choices": [{ "delta": {}, "finish_reason": reason }] });
+                if let Some(usage) = response.get("usage").and_then(Value::as_object) {
+                    let cached = usage.get("input_tokens_details").and_then(|details| details.get("cached_tokens"));
+                    chunk["usage"] = json!({
+                        "prompt_tokens": usage.get("input_tokens"),
+                        "completion_tokens": usage.get("output_tokens"),
+                        "prompt_tokens_details": { "cached_tokens": cached },
+                    });
+                }
+                Some(chunk)
+            }
+            "response.failed" => {
+                let error = event.get("response").and_then(|response| response.get("error"));
+                Some(responses_error(error.unwrap_or(&Value::Null)))
+            }
+            "error" if event.get("error").is_some() => Some(event.clone()),
+            "error" => Some(responses_error(event)),
+            _ => None,
+        }
+    }
+
+    /// 输出项：工具调用开始时给 id 和名字（参数后面一段段来；一直没来的，结束时整个给）；思考结束时记下加密内容，排到后面第一个工具调用前
+    fn responses_item(&mut self, index: i64, item: &Map<String, Value>) -> Option<Value> {
+        match item.get("type").and_then(Value::as_str)? {
+            "reasoning" => {
+                self.reasoning_items.extend(responses::reasoning_to_keep(item));
+                None
+            }
+            "function_call" => {
+                let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or_default();
+                let call = match self.pending.get(&index) {
+                    Some(known) if !known.arguments.is_empty() || arguments.is_empty() => return None,
+                    Some(_) => json!({ "index": index, "function": { "arguments": arguments } }),
+                    None => {
+                        let id = item.get("call_id").and_then(Value::as_str).unwrap_or_default();
+                        responses::keep_reasoning(&self.engine_id, id, std::mem::take(&mut self.reasoning_items));
+                        json!({ "index": index, "id": id, "function": { "name": item.get("name"), "arguments": arguments } })
+                    }
+                };
+                Some(json!({ "choices": [{ "delta": { "tool_calls": [call] } }] }))
+            }
+            _ => None,
+        }
+    }
+
+    /// 处理一个 chat/completions 的 chunk：usage → error.message → choices[0] 的 finish_reason 与 delta
+    fn feed_chat(&mut self, chunk: &Value, now: DateTime<Utc>) -> Feed {
         let mut feed = Feed::default();
         let Some(object) = chunk.as_object() else { return feed };
         if let Some(usage) = object.get("usage").and_then(Value::as_object) {
@@ -225,6 +317,9 @@ impl Feed {
         if self.looped {
             out.insert("loop".into(), json!(true));
         }
+        if self.done {
+            out.insert("done".into(), json!(true));
+        }
         if let Some(error) = &self.error {
             out.insert(
                 "error".into(),
@@ -273,6 +368,13 @@ pub fn interrupted(finish_reason: Option<&str>, saw_done: bool) -> Option<(bool,
     }
 }
 
+/// Responses 的报错（`{code, message}`）翻成 chat/completions 流里的 error；code 当 type，限流、额度的认法不变
+fn responses_error(error: &Value) -> Value {
+    let message = error.get("message").and_then(Value::as_str).unwrap_or("模型生成失败（服务端没有说明原因）");
+    let code = error.get("code").cloned().unwrap_or(Value::Null);
+    json!({ "error": { "message": message, "type": code, "code": code } })
+}
+
 /// == Swift `as? Int`：整数（或没有小数部分的浮点数）
 fn as_int(value: &Value) -> Option<i64> {
     let number = value.as_number()?;
@@ -295,9 +397,10 @@ type Shared = Arc<Mutex<Parser>>;
 static PARSERS: LazyLock<Mutex<HashMap<u64, Shared>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
-pub fn open(show_reasoning: bool, quota: bool) -> u64 {
+pub fn open(show_reasoning: bool, quota: bool, engine_id: &str) -> u64 {
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
-    PARSERS.lock().unwrap().insert(id, Arc::new(Mutex::new(Parser::new(show_reasoning, quota))));
+    let parser = Parser { engine_id: engine_id.to_string(), ..Parser::new(show_reasoning, quota) };
+    PARSERS.lock().unwrap().insert(id, Arc::new(Mutex::new(parser)));
     id
 }
 
@@ -421,6 +524,95 @@ mod tests {
         assert_eq!(result["loop"]["inReasoning"], true);
         assert_eq!(result["toolCalls"], json!([]));
         assert_eq!(result["inReasoning"], true);
+    }
+
+    #[test]
+    fn responses_stream() {
+        let mut parser = Parser { engine_id: "t-stream".into(), ..Parser::new(true, true) };
+        assert_eq!(feed(&mut parser, r#"{"type":"response.created","response":{"id":"r"}}"#), Feed::default());
+        let first = feed(&mut parser, r#"{"type":"response.reasoning_summary_text.delta","delta":"想一想"}"#);
+        assert_eq!((first.chunks, first.first_token), (vec!["<think>".to_string(), "想一想".to_string()], true));
+        assert_eq!(feed(&mut parser, r#"{"type":"response.reasoning_summary_part.added","summary_index":0}"#), Feed::default());
+        assert_eq!(feed(&mut parser, r#"{"type":"response.reasoning_summary_part.added","summary_index":1}"#).chunks, ["\n\n"]);
+        feed(
+            &mut parser,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","encrypted_content":"密"}}"#,
+        );
+        assert_eq!(
+            feed(&mut parser, r#"{"type":"response.output_text.delta","output_index":1,"delta":"好的"}"#).chunks,
+            ["</think>", "好的"]
+        );
+        feed(
+            &mut parser,
+            r#"{"type":"response.output_item.added","output_index":2,"item":{"type":"function_call","id":"fc_1","call_id":"call_a","name":"read_file","arguments":""}}"#,
+        );
+        let delta =
+            feed(&mut parser, r#"{"type":"response.function_call_arguments.delta","output_index":2,"item_id":"fc_1","delta":"{\"pa"}"#);
+        assert_eq!(delta.arguments_delta, "{\"pa");
+        feed(&mut parser, r#"{"type":"response.function_call_arguments.delta","output_index":2,"delta":"th\":1}"}"#);
+        // 结束时的整份不重复算
+        feed(&mut parser, r#"{"type":"response.function_call_arguments.done","output_index":2,"arguments":"{\"path\":1}"}"#);
+        feed(
+            &mut parser,
+            r#"{"type":"response.output_item.done","output_index":2,"item":{"type":"function_call","call_id":"call_a","name":"read_file","arguments":"{\"path\":1}"}}"#,
+        );
+        // 有的中转站不发增量：结束时才有参数
+        feed(
+            &mut parser,
+            r#"{"type":"response.output_item.added","output_index":3,"item":{"type":"function_call","call_id":"call_b","name":"list","arguments":""}}"#,
+        );
+        feed(
+            &mut parser,
+            r#"{"type":"response.output_item.done","output_index":3,"item":{"type":"function_call","call_id":"call_b","name":"list","arguments":"{\"a\":2}"}}"#,
+        );
+        let end = feed(
+            &mut parser,
+            r#"{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":100,"output_tokens":7,"input_tokens_details":{"cached_tokens":80}}}}"#,
+        );
+        assert!(end.done);
+        let result = parser.result();
+        assert_eq!((result["content"].clone(), result["reasoning"].clone()), (json!("好的"), json!("想一想\n\n")));
+        assert_eq!(
+            result["toolCalls"],
+            json!([{"id": "call_a", "name": "read_file", "arguments": "{\"path\":1}"}, {"id": "call_b", "name": "list", "arguments": "{\"a\":2}"}])
+        );
+        assert_eq!(
+            (result["promptTokens"].clone(), result["completionTokens"].clone(), result["cachedTokens"].clone()),
+            (json!(100), json!(7), json!(80))
+        );
+        assert_eq!(result["finishReason"], "tool_calls");
+        // 思考排到第一个工具调用前面
+        let body = responses::body(
+            json!({ "messages": [{ "role": "assistant", "content": "", "tool_calls": [{ "id": "call_a", "function": { "name": "read_file", "arguments": "{}" } }] }], "reasoning_effort": "low" }),
+            "t-stream",
+        );
+        assert_eq!(body["input"][0], json!({ "type": "reasoning", "summary": [], "encrypted_content": "密" }));
+    }
+
+    #[test]
+    fn responses_endings() {
+        let mut stop = Parser::new(true, true);
+        assert!(feed(&mut stop, r#"{"type":"response.completed","response":{}}"#).done);
+        assert_eq!(stop.result()["finishReason"], "stop");
+        let mut cut = Parser::new(true, true);
+        assert!(feed(&mut cut, r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}"#).done);
+        assert_eq!(cut.result()["finishReason"], "length");
+        let mut filtered = Parser::new(true, true);
+        feed(&mut filtered, r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"content_filter"}}}"#);
+        assert_eq!(interrupted(filtered.result()["finishReason"].as_str(), true).map(|(transient, _)| transient), Some(false));
+        // 报错：三种写法，额度和限流照旧认
+        let mut parser = Parser::new(true, true);
+        let failed = feed(&mut parser, r#"{"type":"response.failed","response":{"error":{"code":"server_error","message":"炸了"}}}"#);
+        assert_eq!(failed.error, Some(StreamError::Failed { message: "炸了".into() }));
+        let limited =
+            feed(&mut parser, r#"{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"慢点"}}}"#);
+        assert_eq!(limited.error, Some(StreamError::RateLimit { message: "慢点".into() }));
+        let quota = feed(&mut parser, r#"{"type":"error","code":"insufficient_quota","message":"You exceeded your current quota"}"#);
+        assert!(matches!(quota.error, Some(StreamError::Quota { .. })), "{quota:?}");
+        let nested = feed(&mut parser, r#"{"type":"error","error":{"message":"不行"}}"#);
+        assert_eq!(nested.error, Some(StreamError::Failed { message: "不行".into() }));
+        let bare = feed(&mut parser, r#"{"type":"response.failed","response":{}}"#);
+        assert!(matches!(bare.error, Some(StreamError::Failed { .. })));
     }
 
     #[test]

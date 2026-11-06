@@ -36,6 +36,7 @@ pub mod prompts;
 pub mod provider_store;
 pub mod quota;
 pub mod repetition;
+pub mod responses;
 pub mod script_tools;
 pub mod secret_guard;
 pub mod secret_store;

@@ -344,7 +344,8 @@ impl Loop {
     }
 
     /// 这段请求的请求体（遮过密钥）；x_friday：本地大模型的调度提示（两端拼好）
-    pub fn body(&self, include_tools: bool, x_friday: Option<Value>) -> Value {
+    /// responses：换成 Responses 接口的写法（两端这段请求发到哪由它定，所以由两端传）
+    pub fn body(&self, include_tools: bool, x_friday: Option<Value>, responses: bool) -> Value {
         let tools: &[Value] = if include_tools && self.config.supports_tools { &self.settings.tools } else { &[] };
         let options = BodyOptions {
             model: self.config.model.clone(),
@@ -361,7 +362,8 @@ impl Loop {
             engine_id: self.config.engine_id.clone(),
             x_friday,
         };
-        chat_request::masked(chat_request::request_body(&options))
+        let body = chat_request::request_body(&options);
+        chat_request::masked(if responses { crate::responses::body(body, &self.config.engine_id) } else { body })
     }
 
     /// 请求被说超长：记下报错里的上限（和实际长度，校准估算），压完重发一次（v2.86 起在线模型也这样，以前在线模型直接失败）。
@@ -686,7 +688,7 @@ mod tests {
         let prepared = engine.prepare(None, None);
         assert_eq!((prepared["includeTools"].clone(), prepared["showReasoning"].clone()), (json!(true), json!(true)));
         assert_eq!(prepared["folded"], Value::Null);
-        assert_eq!(engine.body(true, None)["tools"], json!([{ "type": "function" }]));
+        assert_eq!(engine.body(true, None, false)["tools"], json!([{ "type": "function" }]));
         let calls = Pass {
             tool_calls: vec![("a".into(), "get_time".into(), "{}".into()), ("b".into(), "read".into(), "{\"pa".into())],
             finish_reason: Some("tool_calls".into()),
@@ -729,7 +731,7 @@ mod tests {
         let prepared = engine.prepare(None, None);
         assert_eq!(prepared["includeTools"], false);
         assert_eq!(engine.history().last().unwrap()["content"], "到 1 轮了，收尾");
-        assert!(engine.body(false, None).get("tools").is_none());
+        assert!(engine.body(false, None, false).get("tools").is_none());
         assert!(engine.wrap_up_failed().starts_with("（已连续调用工具 1 轮"));
         // 截断了接着写，续写的那段不显示思考
         let mut engine = Loop::new(config(), Vec::new());

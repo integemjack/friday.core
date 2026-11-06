@@ -1047,6 +1047,14 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
         "chat.unsupportedParameters" => {
             Ok(Value::from(chat_request::unsupported_parameters(int(params, "status")?, &string(params, "text")?)))
         }
+        // {status, text, body, engineID} → {body, responses} | null（请求被打回来了：改好的请求体，responses 是要换到 Responses 接口；null 照常报错）
+        "chat.refused" => {
+            let body = params.get("body").unwrap_or(&Value::Null);
+            Ok(chat_request::refused(int(params, "status")?, &string(params, "text")?, body, &string(params, "engineID")?)
+                .unwrap_or(Value::Null))
+        }
+        // {engineID} → 这个引擎这次运行里要不要走 Responses 接口
+        "chat.usesResponses" => Ok(Value::from(chat_request::uses_responses(&string(params, "engineID")?))),
         // {engineID} → [这个引擎说过不接受的]
         "chat.unsupportedFor" => Ok(Value::from(chat_request::unsupported_for(&string(params, "engineID")?))),
         // {engineID, names} → null（记住，本次运行内之后的请求都不带）
@@ -1446,15 +1454,17 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
         // {showReasoning, quota} → {stream}（一段请求一个；quota：流里的报错要不要按额度用完认）
         "stream.open" => {
             let flag = |key: &str| params.get(key).and_then(Value::as_bool).unwrap_or(false);
-            Ok(json!({ "stream": chat_stream::open(flag("showReasoning"), flag("quota")) }))
+            let engine_id = params.get("engineID").and_then(Value::as_str).unwrap_or_default();
+            Ok(json!({ "stream": chat_stream::open(flag("showReasoning"), flag("quota"), engine_id) }))
         }
         // {stream} → null
         "stream.close" => {
             chat_stream::close(handle(params, "stream")?);
             Ok(Value::Null)
         }
-        // {chunk, stream, now?} → {chunks?, argumentsDelta?, firstToken?, loop?, error?: {kind: quota | rateLimit | failed, message,
-        // limit?, resetSeconds?}}（chunk 是 SSE data: 的负载原样嵌进来；空的字段不写；loop / error：不再往下读）
+        // {chunk, stream, now?} → {chunks?, argumentsDelta?, firstToken?, loop?, done?, error?: {kind: quota | rateLimit | failed, message,
+        // limit?, resetSeconds?}}（chunk 是 SSE data: 的负载原样嵌进来；空的字段不写；loop / error：不再往下读；
+        // done：Responses 流的结束事件，等于 [DONE]）
         "stream.feed" => {
             let now = now(params)?;
             let chunk = params.get("chunk").unwrap_or(&Value::Null);
@@ -1716,11 +1726,11 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
             let override_id = override_id(params);
             loop_of(params, |engine| engine.prepare(probed, override_id))
         }
-        // {loop, includeTools, xFriday?} → 请求体（遮过密钥）
+        // {loop, includeTools, xFriday?, responses?} → 请求体（遮过密钥；responses：Responses 接口的写法）
         "loop.body" => {
-            let include = flag(params, "includeTools");
+            let (include, responses) = (flag(params, "includeTools"), flag(params, "responses"));
             let x_friday = params.get("xFriday").filter(|value| !value.is_null()).cloned();
-            loop_of(params, |engine| engine.body(include, x_friday))
+            loop_of(params, |engine| engine.body(include, x_friday, responses))
         }
         // {loop, promptTokens, contextTokens} → {retry, fitted?}（请求被说超长）
         "loop.overflow" => {

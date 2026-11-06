@@ -2,16 +2,16 @@
 //! requestBody / transport）：拼请求体、接口说不接受的可选参数（认报错、按引擎记住）、重试和限流的等待、上下文超长的报错。
 //! 发请求、读流、闸门、退避的计时留在两端（URLSession / Qt 走系统代理）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
 
 use regex::Regex;
 use serde_json::{Map, Value, json};
 
-use crate::{engines, secret_guard};
+use crate::{engines, responses, secret_guard};
 
 /// v1.20：接口说不接受时可以去掉的：都是 Friday 自己加的可选参数，去掉后按模型的默认值
-pub const DROPPABLE: [&str; 11] = [
+pub const DROPPABLE: [&str; 17] = [
     "temperature",
     "top_p",
     "max_tokens",
@@ -23,6 +23,13 @@ pub const DROPPABLE: [&str; 11] = [
     "presence_penalty",
     "frequency_penalty",
     "seed",
+    // Responses 接口的（见 responses.rs）
+    "max_output_tokens",
+    "reasoning",
+    "reasoning.effort",
+    "reasoning.summary",
+    "include",
+    "store",
 ];
 
 /// v2.76 思考参数（ThinkingSupport 的几种开关）
@@ -131,6 +138,7 @@ pub fn unsupported_parameters(status: i64, text: &str) -> Vec<String> {
             r"(?i)unsupported (?:parameter|value):\s*'([\w.]+)'",
             r"(?i)unrecognized request arguments? supplied:\s*([A-Za-z_][\w, ]*)",
             r"(?i)invalid ([A-Za-z_]+):\s*only\b",
+            r"(?i)unknown parameter:\s*'?([\w.]+)",
         ]
         .iter()
         .map(|pattern| Regex::new(pattern).unwrap())
@@ -155,8 +163,51 @@ pub fn unsupported_parameters(status: i64, text: &str) -> Vec<String> {
         if refusals.iter().any(|word| lowered.contains(word)) {
             names.extend(THINKING.iter().filter(|name| mentions(&lowered, name)).map(|name| name.to_string()));
         }
+        // Responses：思考摘要要组织验证过；加密思考有的模型没有、换了账号解不开
+        if lowered.contains("reasoning summar") {
+            names.push("reasoning.summary".to_string());
+        }
+        if lowered.contains("encrypted") {
+            names.push("include".to_string());
+        }
     }
     names
+}
+
+/// 报错点名要用 Responses 接口：「use /v1/responses」「only supported in v1/responses」（后一句是 404）
+pub fn wants_responses(status: i64, text: &str) -> bool {
+    matches!(status, 400 | 404 | 422) && text.to_lowercase().contains("v1/responses")
+}
+
+/// 这个请求被 400 / 422 打回来了，能改的改了再发：报错叫改用 Responses 接口的换过去（记在引擎上，`responses: true`，两端换地址），
+/// 说不接受哪些可选参数的去掉（也记在引擎上）。返回 `{body, responses}`；改不了（请求里已经没有这些、已经是 Responses）返回 None，照常报错
+pub fn refused(status: i64, text: &str, body: &Value, engine_id: &str) -> Option<Value> {
+    let chat = body.get("messages").is_some();
+    if chat && wants_responses(status, text) {
+        remember_responses(engine_id);
+        return Some(json!({ "body": responses::body(body.clone(), engine_id), "responses": true }));
+    }
+    let mut changed = body.clone();
+    let mut dropped: Vec<String> = Vec::new();
+    for name in unsupported_parameters(status, text) {
+        // Responses 里这两个换了地方；记的还是原来的名字，拼请求体时就不带了
+        let path = match name.as_str() {
+            "reasoning_effort" if !chat => "reasoning",
+            "max_tokens" if !chat => "max_output_tokens",
+            other => other,
+        };
+        if responses::remove_path(&mut changed, path) {
+            if name == "include" {
+                responses::remove_reasoning_items(&mut changed);
+            }
+            dropped.push(name);
+        }
+    }
+    if dropped.is_empty() {
+        return None;
+    }
+    remember_unsupported(engine_id, &dropped);
+    Some(json!({ "body": changed, "responses": false }))
 }
 
 /// 单独点了这个名字（== `(?<![\w.])name(?![\w])`：前面不是字或点，后面不是字）
@@ -170,6 +221,16 @@ fn mentions(text: &str, name: &str) -> bool {
 }
 
 static UNSUPPORTED: LazyLock<Mutex<HashMap<String, Vec<String>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static RESPONSES: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// 这个引擎说过要用 Responses 接口（本次运行内记住，和不接受的参数一样：下次启动再试一次、再换过去）
+pub fn uses_responses(engine_id: &str) -> bool {
+    RESPONSES.lock().unwrap().contains(engine_id)
+}
+
+pub fn remember_responses(engine_id: &str) {
+    RESPONSES.lock().unwrap().insert(engine_id.to_string());
+}
 
 /// 这个引擎说过不接受的可选参数（本次运行内记住；之后的请求、新派的子智能体都不再带）
 pub fn unsupported_for(engine_id: &str) -> Vec<String> {
@@ -354,6 +415,10 @@ mod tests {
         assert_eq!(names(400, "`reasoning_effort` is not supported with this model"), ["reasoning_effort"]);
         assert_eq!(names(400, "Unknown parameter: thinking"), ["thinking"]);
         assert!(names(400, "reasoning_effort must be low, medium or high").is_empty());
+        assert_eq!(names(400, "Unknown parameter: 'include'."), ["include"]);
+        assert_eq!(names(400, "Your organization must be verified to generate reasoning summaries."), ["reasoning.summary"]);
+        assert_eq!(names(400, "The encrypted content could not be verified."), ["include"]);
+        assert_eq!(names(400, "Unsupported value: 'reasoning.effort' does not support 'low' with this model."), ["reasoning.effort"]);
         assert!(names(400, "Invalid API key").is_empty());
         // 名字是别的词的一部分不算
         assert!(names(400, "unknown parameter: thinking_budget").is_empty());
@@ -387,5 +452,50 @@ mod tests {
         assert_eq!(context_overflow(500, llama), None);
         assert_eq!(context_overflow(413, "Prompt is too long"), Some((0, 0)));
         assert_eq!(context_overflow(400, r#"{"error":{"message":"You requested 9000 tokens, too many tokens"}}"#), Some((9_000, 0)));
+    }
+
+    const TERRA: &str = r#"{"error":{"message":"Function tools with reasoning_effort are not supported for gpt-6.1-terra in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'.","type":"invalid_request_error","param":"reasoning_effort","code":null}}"#;
+
+    #[test]
+    fn switches_to_responses() {
+        let chat =
+            json!({ "model": "m", "messages": [{ "role": "user", "content": "你好" }], "reasoning_effort": "high", "temperature": 0.6 });
+        assert!(!uses_responses("t-terra"));
+        let fixed = refused(400, TERRA, &chat, "t-terra").unwrap();
+        assert_eq!(fixed["responses"], true);
+        assert!(uses_responses("t-terra") && unsupported_for("t-terra").is_empty(), "换接口，思考参数不算不接受");
+        assert_eq!(fixed["body"]["reasoning"]["effort"], "high");
+        assert_eq!(fixed["body"]["input"], json!([{ "role": "user", "content": "你好" }]));
+        // 已经是 Responses 了还这么说：不再换，也没什么好去掉的，照常报错（不会来回重发）
+        assert_eq!(refused(400, "use /v1/responses", &fixed["body"], "t-terra"), None);
+        // 只支持 Responses 的模型回的是 404
+        let only = "This model is only supported in v1/responses and not in v1/chat/completions.";
+        assert_eq!(refused(404, only, &chat, "t-codex").unwrap()["responses"], true);
+        assert_eq!(refused(500, only, &chat, "t-busy"), None);
+        assert_eq!(refused(404, "Not found", &chat, "t-busy"), None);
+    }
+
+    #[test]
+    fn refused_drops_parameters() {
+        // chat/completions：和以前一样
+        let chat = json!({ "messages": [], "temperature": 0.6 });
+        let text = "Unsupported parameter: 'temperature' is not supported with this model.";
+        let fixed = refused(400, text, &chat, "t-chat").unwrap();
+        assert_eq!((fixed["body"].clone(), fixed["responses"].clone()), (json!({ "messages": [] }), json!(false)));
+        assert_eq!(unsupported_for("t-chat"), ["temperature"]);
+        assert_eq!(refused(400, text, &fixed["body"], "t-chat"), None);
+        // Responses：思考参数换了地方、去掉里层的、加密思考连带回的一起去掉
+        let sent = json!({ "input": [{ "type": "reasoning" }, { "role": "user", "content": "x" }], "max_output_tokens": 9,
+                           "reasoning": { "effort": "high", "summary": "auto" }, "include": ["reasoning.encrypted_content"] });
+        let body = refused(400, "`reasoning_effort` is not supported with this model", &sent, "t-resp").unwrap()["body"].clone();
+        assert!(body.get("reasoning").is_none());
+        let body = refused(400, "Unsupported parameter: 'max_tokens' is not supported", &sent, "t-resp").unwrap()["body"].clone();
+        assert!(body.get("max_output_tokens").is_none());
+        let body =
+            refused(400, "Your organization must be verified to generate reasoning summaries", &sent, "t-resp").unwrap()["body"].clone();
+        assert_eq!(body["reasoning"], json!({ "effort": "high" }));
+        let body = refused(400, "encrypted content could not be verified", &sent, "t-resp").unwrap()["body"].clone();
+        assert!(body.get("include").is_none());
+        assert_eq!(body["input"], json!([{ "role": "user", "content": "x" }]));
     }
 }
