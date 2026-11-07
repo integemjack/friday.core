@@ -30,7 +30,7 @@ struct Archive {
     items: HashMap<String, (u64, Arc<Conversation>)>,
     order: Vec<String>,
     order_seq: u64,
-    /// 上一次编码 + 拼整份花的秒数（后台写盘线程里量的）
+    /// 上一次编码 + 拼整份写进文件花的秒数（后台写盘线程里量的）
     cost: Arc<Mutex<f64>>,
 }
 
@@ -92,18 +92,19 @@ pub fn save(id: u64, seq: u64, order: Vec<String>, changed: Vec<Conversation>, e
         }
     }
     let cost = archive.cost.clone();
-    writer::write(archive.path.clone(), move || {
+    writer::write(archive.path.clone(), move |file| {
         let start = Instant::now();
         let items: Vec<&Conversation> = snapshot.iter().map(Arc::as_ref).collect();
-        let data = serde_json::to_vec(&items).unwrap_or_default();
+        // 边编码边写文件，不在内存里拼整份（writer.rs 开头）；编码出错时不换名，原来的存档不动
+        let written = serde_json::to_writer(file, &items);
         *cost.lock().unwrap() = encode_seconds + start.elapsed().as_secs_f64();
-        data
+        written.map_err(std::io::Error::from)
     });
     let last = *archive.cost.lock().unwrap();
     Some((interval(last.max(encode_seconds)), missing))
 }
 
-/// 生成过程中强制落盘的间隔：至少 3 秒；编码一次越慢越长（×30，保存占用的 CPU 不超过约 3%），最多 30 秒
+/// 生成过程中强制落盘的间隔：至少 3 秒；编码并写盘一次越慢越长（×30，保存占用的 CPU 不超过约 3%），最多 30 秒
 pub fn interval(cost_seconds: f64) -> f64 {
     (cost_seconds * 30.0).clamp(3.0, 30.0)
 }

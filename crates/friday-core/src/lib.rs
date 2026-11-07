@@ -19,6 +19,7 @@ pub mod deploy;
 pub mod engine_loop;
 pub mod engines;
 pub mod events;
+pub mod exit_log;
 pub mod file_changes;
 pub mod file_edit;
 pub mod file_search;

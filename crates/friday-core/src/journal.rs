@@ -75,7 +75,7 @@ impl Journal {
     fn save(&self) {
         let Some(path) = &self.file else { return };
         let snapshot = self.entries.clone();
-        crate::writer::write(path.clone(), move || Value::Array(snapshot).to_string().into_bytes());
+        crate::writer::write(path.clone(), move |file| serde_json::to_writer(file, &snapshot).map_err(std::io::Error::from));
     }
 }
 

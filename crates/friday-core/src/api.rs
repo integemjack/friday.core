@@ -4,7 +4,7 @@
 //! code：`unknownMethod`（没有这个方法）、`invalidParams`（参数不对）、`internal`（核心里出错，C 接口层兜住的 panic 也报这个）。
 //! 时间一律用 Unix 毫秒（`now` 不传 = 现在），时长一律用秒（浮点）。
 //!
-//! 方法按模块分组（`quota.*`、`tools.*`、`secrets.*`、`vault.*`、`fold.*`、`conversations.*`、`diff.*`、`archive.*`、`mcpClient.*`、`journal.*`、`engines.*`、`prompts.*`、`promptHistory.*`、`models.*`、`stream.*`、`repetition.*`、`chat.*`、`gate.*`、`context.*`、`edit.*`、`files.*`、`changes.*`、`shell.*`、`tools.*`）。有状态的（`vault.*`、`journal.*`、`stream.*`）先 open 拿句柄，后面的方法带上它，每个方法的参数和结果写在下面各自的函数上。
+//! 方法按模块分组（`quota.*`、`tools.*`、`secrets.*`、`vault.*`、`fold.*`、`conversations.*`、`diff.*`、`archive.*`、`mcpClient.*`、`journal.*`、`exitLog.*`、`engines.*`、`prompts.*`、`promptHistory.*`、`models.*`、`stream.*`、`repetition.*`、`chat.*`、`gate.*`、`context.*`、`edit.*`、`files.*`、`changes.*`、`shell.*`、`tools.*`）。有状态的（`vault.*`、`journal.*`、`stream.*`）先 open 拿句柄，后面的方法带上它，每个方法的参数和结果写在下面各自的函数上。
 
 use serde_json::{Map, Value, json};
 
@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use crate::chat_models::Conversation;
 use crate::{
     agents, approval, archive, capability_store, chat_request, chat_stream, chooser, context, conversations, delivery, deploy, engine_loop,
-    engines, events, file_changes, file_edit, file_search, folding, gate, journal, line_diff, liveness, mcp_client, mcp_config,
+    engines, events, exit_log, file_changes, file_edit, file_search, folding, gate, journal, line_diff, liveness, mcp_client, mcp_config,
     model_traits, prompt_history, prompt_store, prompts, provider_store, quota, repetition, script_tools, secret_guard, secret_store,
     shell_rules, swift_json, task_state, team, tool_aliases, tool_defs, tool_files,
 };
@@ -95,6 +95,23 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
         // {} → null（等后台排着的写盘都写完；两端退出前调）
         "core.flush" => {
             crate::writer::flush();
+            Ok(Value::Null)
+        }
+
+        // {directory, version, takeover?} → null（桌面端启动时调：记一行启动，上次没走完退出也记下；takeover：上一个进程可能还没退完）
+        "exitLog.start" => {
+            let takeover = params.get("takeover").and_then(Value::as_bool).unwrap_or(false);
+            exit_log::start(std::path::Path::new(&string(params, "directory")?), &string(params, "version")?, takeover);
+            Ok(Value::Null)
+        }
+        // {text} → null（记一行：谁要退出、又打开了一次之类；还没 start 时什么也不做）
+        "exitLog.note" => {
+            exit_log::note(&string(params, "text")?);
+            Ok(Value::Null)
+        }
+        // {} → null（走完退出时调）
+        "exitLog.finish" => {
+            exit_log::finish();
             Ok(Value::Null)
         }
 
