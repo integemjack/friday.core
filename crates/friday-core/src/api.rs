@@ -1479,9 +1479,10 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
             chat_stream::close(handle(params, "stream")?);
             Ok(Value::Null)
         }
-        // {chunk, stream, now?} → {chunks?, argumentsDelta?, firstToken?, loop?, done?, error?: {kind: quota | rateLimit | failed, message,
+        // {chunk, stream, now?} → {chunks?, argumentsDelta?, firstToken?, loop?, done?, tools?, error?: {kind: quota | rateLimit | failed, message,
         // limit?, resetSeconds?}}（chunk 是 SSE data: 的负载原样嵌进来；空的字段不写；loop / error：不再往下读；
-        // done：Responses 流的结束事件，等于 [DONE]）
+        // done：Responses 流的结束事件，等于 [DONE]；tools：chunk 顶层 x_friday.tool 的原样列表——别处执行的工具活动，只显示不执行，
+        // 见 Friday.Powers docs/opencode-protocol.md）
         "stream.feed" => {
             let now = now(params)?;
             let chunk = params.get("chunk").unwrap_or(&Value::Null);

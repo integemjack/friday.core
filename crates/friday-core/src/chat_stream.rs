@@ -50,6 +50,8 @@ pub struct Feed {
     /// Responses 流的结束事件（等于 [DONE]）
     pub done: bool,
     pub error: Option<StreamError>,
+    /// 别处执行的工具的活动（只显示，不执行）：chunk 顶层的 x_friday.tool（OpenCode 的桥：它自己的智能体跑的工具），原样交出去
+    pub tools: Vec<Value>,
 }
 
 /// 一段请求的解析状态
@@ -175,6 +177,14 @@ impl Parser {
     fn feed_chat(&mut self, chunk: &Value, now: DateTime<Utc>) -> Feed {
         let mut feed = Feed::default();
         let Some(object) = chunk.as_object() else { return feed };
+        // 别处执行的工具（delta 是空的，可能连 choices 都没有）：在下面的提前返回之前拿出来
+        if let Some(tool) = object.get("x_friday").and_then(|x| x.get("tool")).filter(|tool| tool.is_object()) {
+            feed.tools.push(tool.clone());
+            if !self.first_token {
+                self.first_token = true;
+                feed.first_token = true;
+            }
+        }
         if let Some(usage) = object.get("usage").and_then(Value::as_object) {
             if let Some(tokens) = int_at(usage, "prompt_tokens") {
                 self.prompt_tokens = tokens;
@@ -325,6 +335,9 @@ impl Feed {
         if self.done {
             out.insert("done".into(), json!(true));
         }
+        if !self.tools.is_empty() {
+            out.insert("tools".into(), json!(self.tools));
+        }
         if let Some(error) = &self.error {
             out.insert(
                 "error".into(),
@@ -424,6 +437,25 @@ mod tests {
 
     fn feed(parser: &mut Parser, chunk: &str) -> Feed {
         parser.feed(&serde_json::from_str(chunk).unwrap(), Utc::now())
+    }
+
+    #[test]
+    fn external_tool_events() {
+        // OpenCode 的桥：x_friday.tool（delta 空、可能没有 choices）原样交出去，不算进 toolCalls（Friday 只显示、不执行）
+        let mut parser = Parser::new(true, true);
+        let running = feed(
+            &mut parser,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":null}],"x_friday":{"tool":{"id":"t1","name":"read","status":"running"}}}"#,
+        );
+        assert_eq!(running.tools, [json!({"id": "t1", "name": "read", "status": "running"})]);
+        assert!(running.first_token);
+        assert_eq!(running.to_json()["tools"][0]["id"], "t1");
+        let done = feed(&mut parser, r#"{"x_friday":{"tool":{"id":"t1","status":"success","output":"1: 12"}}}"#);
+        assert_eq!(done.tools.len(), 1);
+        assert!(!done.first_token);
+        feed(&mut parser, r#"{"choices":[{"delta":{"content":"好的"}}]}"#);
+        assert_eq!(parser.result()["toolCalls"], json!([]));
+        assert_eq!(feed(&mut parser, r#"{"choices":[{"delta":{"content":"。"}}]}"#).to_json().get("tools"), None);
     }
 
     #[test]
