@@ -151,6 +151,12 @@ impl ToolEvent {
     pub fn is_running(&self) -> bool {
         self.status == "running" || self.status == "awaitingApproval"
     }
+
+    /// 别处执行的工具（Friday 的 OpenCode / Claude Code 能力：外部智能体的提问、确认，external）在等用户：
+    /// 问的是那边的智能体，它还在等，应用重开后照样能答（下一句话就是回答），不算被应用退出打断
+    pub fn waits_elsewhere(&self) -> bool {
+        self.status == "awaitingApproval" && self.extra.get("external").and_then(Value::as_bool) == Some(true)
+    }
 }
 
 /// 应用退出时还在跑的派子 Agent 卡片的结果（开头和普通调用一样是「应用退出时仍在运行，已中断」）
@@ -168,11 +174,12 @@ pub fn contains_running(blocks: &[MessageBlock]) -> bool {
     })
 }
 
-/// 应用退出时还在运行或等确认的调用：标成失败并说明原因（递归进子 Agent 记录）。team_tools：会跑子 Agent 的工具名（两端按注册表给）
+/// 应用退出时还在运行或等确认的调用：标成失败并说明原因（递归进子 Agent 记录）。team_tools：会跑子 Agent 的工具名（两端按注册表给）。
+/// 外部智能体在等用户回答 / 确认的（waits_elsewhere）留着：重开后提问卡片、允许按钮照样在
 pub fn mark_interrupted(blocks: &mut [MessageBlock], team_tools: &[String]) {
     for block in blocks {
         let BlockKind::Tool(event) = &mut block.kind else { continue };
-        if event.is_running() {
+        if event.is_running() && !event.waits_elsewhere() {
             // 派子 Agent 的卡片：说清它不会再交回结果，主 Agent 下一轮看到才不会以为它还在后台跑
             event.result = if event.status == "awaitingApproval" {
                 INTERRUPTED_APPROVAL_TEXT.to_string()
@@ -233,5 +240,24 @@ mod tests {
         let BlockKind::Tool(nested) = &event(1).transcript.unwrap()[0].kind else { unreachable!() };
         assert_eq!((nested.status.as_str(), nested.result.as_str()), ("failed", INTERRUPTED_APPROVAL_TEXT));
         assert_eq!(event(2).result, "ok");
+    }
+
+    #[test]
+    fn external_waits_survive_restart() {
+        // OpenCode 的提问在等回答（external + awaitingApproval）：重开后留着；外部工具还在跑的照样标中断
+        let mut blocks: Vec<MessageBlock> = serde_json::from_value(json!([
+            {"id": "A", "kind": {"tool": {"_0": {"id": "1", "name": "question", "arguments": "{}", "status": "awaitingApproval", "result": "等你回答", "external": true}}}},
+            {"id": "B", "kind": {"tool": {"_0": {"id": "2", "name": "bash", "arguments": "", "status": "running", "result": "", "external": true}}}},
+            {"id": "C", "kind": {"tool": {"_0": {"id": "3", "name": "ask_user", "arguments": "{}", "status": "awaitingApproval", "result": ""}}}},
+        ]))
+        .unwrap();
+        mark_interrupted(&mut blocks, &[]);
+        let event = |index: usize| match &blocks[index].kind {
+            BlockKind::Tool(event) => event.as_ref().clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!((event(0).status.as_str(), event(0).result.as_str()), ("awaitingApproval", "等你回答"));
+        assert_eq!((event(1).status.as_str(), event(1).result.as_str()), ("failed", INTERRUPTED_TEXT));
+        assert_eq!((event(2).status.as_str(), event(2).result.as_str()), ("failed", INTERRUPTED_APPROVAL_TEXT));
     }
 }
