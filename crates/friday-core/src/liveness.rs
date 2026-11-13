@@ -16,6 +16,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::agents::short_id;
 use crate::chat_models::{BlockKind, MessageBlock};
+use crate::prompts::{self, Args};
 
 /// 期限到了之后再给这么久交付（秒）
 pub const DEADLINE_GRACE: f64 = 60.0;
@@ -46,25 +47,24 @@ pub fn ended_text(stopped_by: Option<&str>, message: &str, partial: Option<&str>
 }
 
 /// 给父级的建议（按卡片文字的开头判断）：用户 / 父级停的别再派；看门狗、期限停的可以换个做法或收尾；失败的看原因
-pub fn advice(card_text: &str) -> &'static str {
+/// 文字在提示词里（prompts-framework.md 的 agent-ended.*；以前写死在这里）
+pub fn advice(card_text: &str) -> String {
     let failed = card_text.starts_with("失败了");
     // v2.11 模型服务出错、会话留着：打回接着做，不从头派；还没开始做、大脑歇着没派：等一会儿原样重派
-    if failed && card_text.contains("它的会话还留着") {
-        return "是模型服务出错：等一会儿用 rework_agent 打回它接着做（写清从哪接着做），一直不行就换个模型重派，或告诉用户。";
-    }
-    if failed && card_text.contains("原样重派就行") {
-        return "是模型服务出错：等一会儿原样重派（不用改提示词），一直不行就换个模型，或告诉用户。";
-    }
-    if failed {
-        return "判断失败原因：能修就换个做法（拆小一点、换个大脑）再派，不行就自己做或告诉用户。";
-    }
-    if card_text.starts_with("被看门狗") {
-        return "它卡住了：上面做到一半的结果可以直接用；剩下的换个做法（拆小一点、换个大脑）再派，或者自己做。";
-    }
-    if card_text.starts_with("被期限") {
-        return "时间到了：用上面做到一半的结果收尾，没做完的在回答里说明。";
-    }
-    "不要重新派发同样的任务；按已有信息继续（上面做到一半的结果可以直接用），或告诉用户需要什么。"
+    let key = if failed && card_text.contains("它的会话还留着") {
+        "agent-ended.session-kept"
+    } else if failed && card_text.contains("原样重派就行") {
+        "agent-ended.retry-as-is"
+    } else if failed {
+        "agent-ended.failed"
+    } else if card_text.starts_with("被看门狗") {
+        "agent-ended.stalled"
+    } else if card_text.starts_with("被期限") {
+        "agent-ended.deadline"
+    } else {
+        "agent-ended.stopped"
+    };
+    prompts::text(key, &Args::new(), None)
 }
 
 /// 时长的写法：N 秒 / N 分 M 秒 / N 小时 M 分
@@ -105,8 +105,8 @@ pub fn watchdog(now: f64, stall_limit: f64, grace: f64, runs: &[Watched]) -> Vec
                 continue;
             }
             if !run.warned {
-                actions.push(json!({ "id": run.id, "action": "warn", "text": format!(
-                    "派发时给的时间到了：立刻停下手上的事，交付已有结果，没做完的写进「未完成」。{} 秒内不交就会被停掉。", grace as i64) }));
+                let args: Args = std::iter::once(("grace".to_string(), (grace as i64).to_string())).collect();
+                actions.push(json!({ "id": run.id, "action": "warn", "text": prompts::text("agent-deadline.warn", &args, None) }));
             }
         }
         if run.generating
@@ -268,8 +268,19 @@ pub fn is_polling(name: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// 建议、到期提醒取提示词：装一份只有这几段的（== prompts-framework.md 里的原文）
+    fn prompts_installed() -> std::sync::MutexGuard<'static, ()> {
+        prompts::install_for_tests(
+            "@@ agent-ended.session-kept\n是模型服务出错：等一会儿用 rework_agent 打回它接着做\n\n@@ agent-ended.retry-as-is\n是模型服务出错：等一会儿原样重派\n\n\
+             @@ agent-ended.failed\n判断失败原因\n\n@@ agent-ended.stalled\n它卡住了：换个做法\n\n@@ agent-ended.deadline\n时间到了：收尾\n\n\
+             @@ agent-ended.stopped\n不要重新派发同样的任务\n\n\
+             @@ agent-deadline.warn\n派发时给的时间到了：立刻停下手上的事，交付已有结果。{{grace}} 秒内不交就会被停掉。\n",
+        )
+    }
+
     #[test]
     fn texts() {
+        let _prompts = prompts_installed();
         assert_eq!(ended_text(Some("用户"), "", None), "被用户停止了，没做完。");
         assert_eq!(ended_text(None, "网络断了", Some("做了一半")), "失败了：网络断了\n\n做了一半");
         assert!(advice("失败了：x\n\n它的会话还留着").contains("rework_agent"));
@@ -285,6 +296,7 @@ mod tests {
 
     #[test]
     fn watchdog_rules() {
+        let _prompts = prompts_installed();
         let run = |deadline: Option<f64>, warned: bool, generating: bool, last: Option<f64>| Watched {
             id: "A".into(),
             name: "甲".into(),

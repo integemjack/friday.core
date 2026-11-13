@@ -1142,7 +1142,7 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
             let limit = int(params, "limit")?;
             Ok(json!({ "reserve": context::reserve(limit), "threshold": context::threshold(limit), "target": context::target(limit) }))
         }
-        // {history, folded | marks, budget, summaries?: {echoesReasoning, taskStateTool, wholeTools}}
+        // {history, folded | marks, budget, summaries?: {echoesReasoning, taskStateTool, wholeTools, historyTool?}}
         //   → {shortened, dropped, before, after, folded, marks, history?}（压了才带 history；summaries 不给用默认的摘要）
         "context.compact" => {
             let mut history = list(params, "history")?;
@@ -1567,6 +1567,20 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
                 platform.push((name.to_string(), value));
             }
             prompts::setup(bundled, (!directory.is_empty()).then(|| directory.into()), platform);
+            // protected?: {files, prompts}（protected.txt 的 prompt-file、prompt）：智能体的写文件工具动不了这些段
+            if let Some(Value::Object(protected)) = params.get("protected") {
+                let names = |key: &str| -> Vec<String> {
+                    protected
+                        .get(key)
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                };
+                prompts::set_protected(names("files"), names("prompts"));
+            }
             Ok(merge_report(prompts::last_merge()))
         }
         // {key, args?, override?} → 展开好的文字（override：prompts.override 返回的句柄）
@@ -1700,7 +1714,7 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
             Value::Null
         }),
         // {loop, settings: {instructions, tools, temperature, enableThinking, reasoningEffort?, maxOutputTokens?, maxToolRounds,
-        //   continuesWhenTruncated, hasDispatch, folding?: {budget, echoesReasoning, taskStateTool, wholeTools}}, begin?} → null
+        //   continuesWhenTruncated, hasDispatch, folding?: {budget, echoesReasoning, taskStateTool, wholeTools, historyTool?}}, begin?} → null
         //   （换上设置；begin：一轮开始，计数清零）
         "loop.settings" => {
             let settings = object(params, "settings")?;
@@ -1866,11 +1880,11 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
         "fold.arguments" => Ok(Value::Object(folding::arguments(&object(params, "arguments")?))),
         // {json} → 较早的工具调用参数（JSON 文本）的摘要
         "fold.argumentsJSON" => Ok(Value::from(folding::arguments_json(&string(params, "json")?))),
-        // {name, text, taskStateTool, wholeTools} → 较早的工具结果的摘要
+        // {name, text, taskStateTool, wholeTools, historyTool?} → 较早的工具结果的摘要（historyTool：主 Agent 给 read_history，说明让它用这个看全文）
         "fold.toolResult" => Ok(Value::from(folding::tool_result(&string(params, "name")?, &string(params, "text")?, &special(params)?))),
         // {entries} → 估算 token（entries 是在线接口写法的请求历史）
         "fold.estimate" => Ok(Value::from(folding::estimated_tokens(&list(params, "entries")?))),
-        // {history, folded, budget, echoesReasoning, taskStateTool, wholeTools}
+        // {history, folded, budget, echoesReasoning, taskStateTool, wholeTools, historyTool?}
         //   → {steps, folded, before, after, history?}（folded 变了才带 history）
         "fold.session" => {
             let mut history = list(params, "history")?;
@@ -2004,7 +2018,12 @@ fn list(params: &Params, key: &str) -> Result<Vec<Value>, ApiError> {
 }
 
 fn special(params: &Params) -> Result<folding::Special, ApiError> {
-    Ok(folding::Special { task_state: string(params, "taskStateTool")?, whole: string_list(params, "wholeTools")? })
+    // historyTool：看较早原文的工具（主 Agent 的 read_history；子 Agent 不给）
+    Ok(folding::Special {
+        task_state: string(params, "taskStateTool")?,
+        whole: string_list(params, "wholeTools")?,
+        history: params.get("historyTool").and_then(Value::as_str).unwrap_or("").to_string(),
+    })
 }
 
 fn vault_id(params: &Params) -> Result<u64, ApiError> {

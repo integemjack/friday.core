@@ -11,7 +11,14 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::agents::short_id;
 use crate::liveness;
+use crate::prompts::{self, Args};
 use crate::repetition::similarity;
+
+/// 给模型看的说明取提示词（prompts-framework.md 的 dispatch.*、agent-message.*、ancestry；以前写死在这里）
+fn prompt(key: &str, pairs: &[(&str, String)]) -> String {
+    let args: Args = pairs.iter().map(|(name, value)| (name.to_string(), value.clone())).collect();
+    prompts::text(key, &args, None)
+}
 
 /// 只派一个下级、且它的任务和自己的任务相似到这个程度，就是原样往下传
 pub const SHRINK_THRESHOLD: f64 = 0.8;
@@ -59,12 +66,14 @@ pub fn check_dispatch(items: &[Item], attempts: &[Attempt], running: &[Running],
             if role < RETRY_THRESHOLD || task < RETRY_THRESHOLD {
                 continue;
             }
-            return Some(format!(
-                "这次派发和之前没做成的「{}」几乎一样（角色相似度 {}%、任务相似度 {}%），照原样再派还会是同样的结果。先 read_agent_log {} 看它为什么做不成，再换提示词：重写角色、换做法、拆得更细或换个大脑；它还在等验收的话也可以先 rework_agent 打回。",
-                attempt.name,
-                (role * 100.0) as i64,
-                (task * 100.0) as i64,
-                short_id(&attempt.id)
+            return Some(prompt(
+                "dispatch.repeat-failed",
+                &[
+                    ("name", attempt.name.clone()),
+                    ("role", ((role * 100.0) as i64).to_string()),
+                    ("task", ((task * 100.0) as i64).to_string()),
+                    ("id", short_id(&attempt.id)),
+                ],
             ));
         }
         // v2.11 和这一级正在跑的几乎一样：不再派一份
@@ -74,21 +83,16 @@ pub fn check_dispatch(items: &[Item], attempts: &[Attempt], running: &[Running],
             if task < RETRY_THRESHOLD || role < RETRY_THRESHOLD {
                 continue;
             }
-            return Some(format!(
-                "「{}」（id {}）正在做几乎一样的事（任务相似度 {}%），这次没派：等它交回结果（做完会自动交给你）；要补充要求用 message_agent，方向错了用 stop_agent 停掉再派。",
-                run.name,
-                short_id(&run.id),
-                (task * 100.0) as i64
+            return Some(prompt(
+                "dispatch.duplicate",
+                &[("name", run.name.clone()), ("id", short_id(&run.id)), ("task", ((task * 100.0) as i64).to_string())],
             ));
         }
     }
     if let Some((single, own)) = own {
         let score = similarity(single, own);
         if score >= SHRINK_THRESHOLD {
-            return Some(format!(
-                "交给下级的任务和你自己的任务几乎一样（相似度 {}%），这是把整个任务原样往下传。自己做；或者先想清楚能拆成哪几个更小的部分，再分别派出去。",
-                (score * 100.0) as i64
-            ));
+            return Some(prompt("dispatch.passed-down", &[("score", ((score * 100.0) as i64).to_string())]));
         }
     }
     None
@@ -97,8 +101,8 @@ pub fn check_dispatch(items: &[Item], attempts: &[Attempt], running: &[Running],
 /// 交给子智能体的补充消息前面的说明（from：父级的名字；没有是用户补充的）
 pub fn message_note(from: Option<&str>) -> String {
     match from {
-        Some(from) => format!("（{from}在你工作时追加了下面的指示：和你的任务一起考虑，有冲突以它为准。）\n"),
-        None => "（用户在你工作时补充了下面这段话：和你的任务一起考虑，有冲突以它为准。）\n".to_string(),
+        Some(from) => prompt("agent-message.parent", &[("from", from.to_string())]) + "\n",
+        None => prompt("agent-message.user", &[]) + "\n",
     }
 }
 
@@ -142,11 +146,7 @@ pub fn ancestry_note(chain: &[Value], me: &str) -> Option<String> {
             format!("{giver}派给「{name}」：{}", clip(step.get("assignment").and_then(Value::as_str).unwrap_or("")))
         })
         .collect();
-    Some(format!(
-        "[你在整个任务里的位置（Friday 自动附上，只帮你理解背景；你只做上面交给你的那部分）]\n{}\n再往下就是你「{me}」（第 {} 层）。",
-        lines.join("\n"),
-        chain.len() + 1
-    ))
+    Some(prompt("ancestry", &[("lines", lines.join("\n")), ("me", me.to_string()), ("depth", (chain.len() + 1).to_string())]))
 }
 
 /// id 对不上时给它看现在有哪些：running / waiting：[{id, name}]
@@ -213,8 +213,22 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// 这里的说明都取提示词：装一份只有这几段的（== prompts-framework.md 里的原文）
+    fn prompts_installed() -> std::sync::MutexGuard<'static, ()> {
+        prompts::install_for_tests(
+            "@@ dispatch.repeat-failed\n这次派发和之前没做成的「{{name}}」几乎一样（角色相似度 {{role}}%、任务相似度 {{task}}%），先 read_agent_log {{id}}\n\n\
+             @@ dispatch.duplicate\n「{{name}}」（id {{id}}）正在做几乎一样的事（任务相似度 {{task}}%），这次没派\n\n\
+             @@ dispatch.passed-down\n交给下级的任务和你自己的任务几乎一样（相似度 {{score}}%），这是把整个任务原样往下传。\n\n\
+             @@ agent-message.parent\n（{{from}}在你工作时追加了下面的指示：和你的任务一起考虑，有冲突以它为准。）\n\n\
+             @@ agent-message.user\n（用户在你工作时补充了下面这段话：和你的任务一起考虑，有冲突以它为准。）\n\n\
+             @@ ancestry\n[你在整个任务里的位置（Friday 自动附上，只帮你理解背景；你只做上面交给你的那部分）]\n{{lines}}\n再往下就是你「{{me}}」（第 {{depth}} 层）。\n\n\
+             @@ agent-ended.stopped\n不要重新派发同样的任务；按已有信息继续。\n",
+        )
+    }
+
     #[test]
     fn dispatch_checks() {
+        let _prompts = prompts_installed();
         let item = |task: &str| Item { role: "调研员".into(), task: task.into(), engine: String::new() };
         let attempt = Attempt {
             id: "ABCDEF12-0".into(),
@@ -248,6 +262,7 @@ mod tests {
 
     #[test]
     fn texts() {
+        let _prompts = prompts_installed();
         assert_eq!(message_note(Some("组长")), "（组长在你工作时追加了下面的指示：和你的任务一起考虑，有冲突以它为准。）\n");
         assert_eq!(notice_text("finished", "甲", "ABCDEF123", "好了"), "[子 Agent「甲」（id：abcdef12）完成了]\n好了");
         assert_eq!(

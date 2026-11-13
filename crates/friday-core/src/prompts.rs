@@ -69,7 +69,15 @@ struct State {
     snapshot: Snapshot,
 }
 
+/// 受保护清单里跟提示词有关的两种（两端从 protected.txt 读了交来，[`set_protected`]）：整份受保护的文件、受保护的段名（「*」匹配任意字符）
+#[derive(Debug, Default)]
+struct Protected {
+    files: Vec<String>,
+    patterns: Vec<String>,
+}
+
 static STATE: LazyLock<RwLock<State>> = LazyLock::new(|| RwLock::new(State::default()));
+static PROTECTED: LazyLock<RwLock<Protected>> = LazyLock::new(|| RwLock::new(Protected::default()));
 static OVERRIDES: LazyLock<Mutex<HashMap<u64, Snapshot>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
@@ -523,6 +531,80 @@ pub fn check_section(key: &str, text: &str) -> String {
     unique.join("、")
 }
 
+// MARK: - 受保护的段
+
+/// 受保护清单（protected.txt 的 prompt-file、prompt）：智能体的写文件工具动不了这些段（[`protected_refusal`]）。
+/// 以前只有改进者查这份清单，主智能体照「你自己的提示词」那段能把「停下来问用户」「密钥」这些边界也改掉
+pub fn set_protected(files: Vec<String>, patterns: Vec<String>) {
+    *PROTECTED.write().unwrap() = Protected { files, patterns };
+}
+
+/// pattern 里的「*」匹配任意字符，其余原样；整串匹配（同两端的 Protected.matches）
+fn glob_matches(pattern: &str, value: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        return pattern == value;
+    }
+    let (first, last) = (parts[0], parts[parts.len() - 1]);
+    if value.len() < first.len() + last.len() || !value.starts_with(first) || !value.ends_with(last) {
+        return false;
+    }
+    let mut rest = &value[first.len()..value.len() - last.len()];
+    for part in &parts[1..parts.len() - 1] {
+        match rest.find(part) {
+            Some(at) => rest = &rest[at + part.len()..],
+            None => return false,
+        }
+    }
+    true
+}
+
+/// path 是数据目录里的提示词文件（prompts-*.md）就返回文件名
+fn prompt_file_name(path: &Path, dir: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    if !(name.starts_with("prompts-") && name.ends_with(".md")) {
+        return None;
+    }
+    let parent = path.parent()?;
+    let same = parent == dir
+        || match (std::fs::canonicalize(parent), std::fs::canonicalize(dir)) {
+            (Ok(parent), Ok(dir)) => parent == dir,
+            _ => false,
+        };
+    same.then(|| name.to_string())
+}
+
+/// 智能体的 write_file / edit_file 要把 path 写成 after：动了受保护的段（改了、删了、加了）就返回退回的说明（没有写），
+/// 没动、不是提示词文件、没有清单返回 None。注释行不算正文，改了不拦
+pub fn protected_refusal(path: &Path, after: &str) -> Option<String> {
+    let changed = {
+        let state = STATE.read().unwrap();
+        let protected = PROTECTED.read().unwrap();
+        if protected.files.is_empty() && protected.patterns.is_empty() {
+            return None;
+        }
+        let name = prompt_file_name(path, state.dir.as_ref()?)?;
+        // 写之前实际用的：本地有就是本地的，没有按自带的
+        let before = read_file(path).or_else(|| state.bundled_files.get(&name).cloned()).unwrap_or_default();
+        let (old, new) = (parse(&before), parse(&normalized(after)));
+        let whole_file = protected.files.contains(&name);
+        let in_protected_file = |key: &str| {
+            protected.files.iter().any(|file| state.bundled_files.get(file).is_some_and(|content| parse(content).contains_key(key)))
+        };
+        let keys: BTreeSet<&String> = old.keys().chain(new.keys()).collect();
+        keys.into_iter()
+            .filter(|key| old.get(*key) != new.get(*key))
+            .filter(|key| whole_file || in_protected_file(key) || protected.patterns.iter().any(|pattern| glob_matches(pattern, key)))
+            .cloned()
+            .collect::<Vec<String>>()
+    };
+    if changed.is_empty() {
+        return None;
+    }
+    let args: Args = std::iter::once(("keys".to_string(), changed.join("、"))).collect();
+    Some(text("self-prompts.refused", &args, None))
+}
+
 /// 重新读数据目录里的文件（文件改了时 PromptStore 调）；返回内容变了的段名
 pub fn reload() -> Vec<String> {
     let mut state = STATE.write().unwrap();
@@ -618,6 +700,19 @@ pub fn release(id: u64) {
 #[cfg(test)]
 pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
 
+/// 测试里要用提示词的：拿着 [`TEST_LOCK`] 装一份只有这几段的（没有数据目录、没有平台参数）；锁放掉之前别的测试换不掉它
+#[cfg(test)]
+pub(crate) fn install_for_tests(content: &str) -> std::sync::MutexGuard<'static, ()> {
+    let lock = TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    setup(std::iter::once(("prompts-framework.md".to_string(), content.to_string())).collect(), None, Vec::new());
+    lock
+}
+
+/// 折叠说明那两段（== prompts-framework.md 里的原文）：折叠、压历史的测试都要
+#[cfg(test)]
+pub(crate) const FOLD_NOTES_FOR_TESTS: &str = "@@ context-fold.tool-result\n…（较早的工具结果，已折叠，原 {{count}} 字；要看全文用 read_history，不要为了看结果重跑命令）…\n\n\
+    @@ context-fold.tool-result.sub\n…（较早的工具结果，已折叠，原 {{count}} 字；需要细节就重新调用只读的工具，会改东西的命令不要重跑）…\n\n";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,6 +739,50 @@ mod tests {
 
     fn files(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs.iter().map(|(key, value)| (key.to_string(), value.to_string())).collect()
+    }
+
+    /// 智能体的写文件工具动不了受保护的段（protected.txt）：改了、删了、加了都退回，别的段照常能改
+    #[test]
+    fn protected_sections() {
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = std::env::temp_dir().join(format!("friday-core-protected-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let main = "说明\n@@ a\n@// 注释\nA\n\n@@ stops.off-note\n不用停：{{items}}\n\n@@ self-prompts.refused\n没有改：{{keys}} 受保护\n";
+        let framework = "@@ turn-check\n检查\n";
+        setup(files(&[("prompts-main.md", main), ("prompts-framework.md", framework)]), Some(dir.clone()), Vec::new());
+        let path = dir.join("prompts-main.md");
+        // 没有清单：不拦
+        set_protected(Vec::new(), Vec::new());
+        assert_eq!(protected_refusal(&path, &main.replace("不用停", "都不用停")), None);
+        set_protected(vec!["prompts-framework.md".into()], vec!["stops.*".into(), "self-prompts*".into()]);
+        assert!(
+            glob_matches("stops.*", "stops.off-note") && glob_matches("self-prompts*", "self-prompts") && glob_matches("a*c*e", "abcde")
+        );
+        assert!(!glob_matches("secrets", "secrets.more") && !glob_matches("stops.*", "nonstops.x") && !glob_matches("a*c*e", "abde"));
+        // 普通的段、注释：放行
+        assert_eq!(protected_refusal(&path, &main.replace("A\n", "A 改过\n").replace("@// 注释", "@// 换了注释")), None);
+        // 受保护的段改了、删了：退回，说是哪几段
+        assert_eq!(protected_refusal(&path, &main.replace("不用停", "都不用停")).as_deref(), Some("没有改：stops.off-note 受保护"));
+        assert_eq!(protected_refusal(&path, "说明\n@@ a\nA\n").as_deref(), Some("没有改：self-prompts.refused、stops.off-note 受保护"));
+        // 受保护的文件整份不能动（加一段也不行）；把它里面的段写到别的文件里也不行
+        assert!(protected_refusal(&dir.join("prompts-framework.md"), &(framework.to_string() + "\n@@ extra\n新的\n")).is_some());
+        assert_eq!(protected_refusal(&path, &(main.to_string() + "\n@@ turn-check\n放水\n")).as_deref(), Some("没有改：turn-check 受保护"));
+        // 不是提示词文件、不在数据目录里的不管
+        assert_eq!(protected_refusal(&dir.join("notes.md"), "x"), None);
+        assert_eq!(protected_refusal(&std::env::temp_dir().join("prompts-main.md"), "x"), None);
+        // 经写文件工具：退回的没有写进去，放行的照常写
+        let target = path.to_str().unwrap();
+        let refused = crate::tool_files::write_file(target, &main.replace("不用停", "都不用停"));
+        assert!(matches!(refused, Err(crate::tool_files::ToolError::Failed(message)) if message.contains("stops.off-note")));
+        let change = crate::tool_files::Change::One { old_text: "不用停".into(), new_text: "都不用停".into(), replace_all: false };
+        assert!(crate::tool_files::edit_file(target, &change, "").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), main, "退回的没有写");
+        let change = crate::tool_files::Change::One { old_text: "A\n".into(), new_text: "A 改过\n".into(), replace_all: false };
+        assert!(crate::tool_files::edit_file(target, &change, "").is_ok());
+        assert!(std::fs::read_to_string(&path).unwrap().contains("A 改过"));
+        set_protected(Vec::new(), Vec::new());
+        setup(files(&[("prompts-main.md", main)]), None, Vec::new());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// 数据目录里的：第一次写进去、校验、改一段、按段三方合并、恢复成自带的、临时换一套段

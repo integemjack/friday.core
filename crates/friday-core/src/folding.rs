@@ -12,6 +12,8 @@
 use serde_json::{Map, Value};
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::prompts::{self, Args};
+
 /// 还没折叠的历史（不含系统提示和工具说明）超过多少估算 token 就折叠（主会话；子 Agent 会话是它的两倍）
 pub const BUDGET: i64 = 48_000;
 
@@ -23,6 +25,8 @@ pub const SESSION_FOLDED_BUDGET: i64 = BUDGET * 2 / 4;
 pub struct Special {
     pub task_state: String,
     pub whole: Vec<String>,
+    /// 看较早原文的工具（read_history）：主 Agent 有，折叠说明让它用这个看全文；空 = 没有（子 Agent），只说重新调用只读的工具
+    pub history: String,
 }
 
 fn graphemes(text: &str) -> Vec<&str> {
@@ -67,7 +71,7 @@ pub fn arguments_json(json: &str) -> String {
 }
 
 /// 较早的工具结果：任务状态只说记下了；子 Agent 的结果不截（v1.18 起只有它的最终结果，是主 Agent 往下做的依据，和汇报一样不能丢）；
-/// 其他长结果（超过 500 字）留开头 300 字和结尾 150 字（报错、退出码常在结尾）
+/// 其他长结果（超过 500 字）留开头 300 字和结尾 150 字（报错、退出码常在结尾），中间的说明见 [`folded_note`]
 pub fn tool_result(name: &str, text: &str, special: &Special) -> String {
     if name == special.task_state {
         return "（已记下任务状态）".to_string();
@@ -79,12 +83,15 @@ pub fn tool_result(name: &str, text: &str, special: &Special) -> String {
     if parts.len() <= 500 {
         return text.to_string();
     }
-    format!(
-        "{}\n…（较早的工具结果，已折叠，原 {} 字；需要细节就重新调用工具）…\n{}",
-        parts[..300].concat(),
-        parts.len(),
-        parts[parts.len() - 150..].concat()
-    )
+    format!("{}\n{}\n{}", parts[..300].concat(), folded_note(parts.len(), !special.history.is_empty()), parts[parts.len() - 150..].concat())
+}
+
+/// 折叠掉的工具结果中间留的说明（提示词 context-fold.tool-result / .sub）：有 read_history 的让它用那个看全文，
+/// 没有的只说重新调用只读的工具——以前一律写「重新调用工具」，主 Agent 照做会把有副作用的命令再跑一遍
+pub fn folded_note(count: usize, history: bool) -> String {
+    let key = if history { "context-fold.tool-result" } else { "context-fold.tool-result.sub" };
+    let args: Args = std::iter::once(("count".to_string(), count.to_string())).collect();
+    prompts::text(key, &args, None)
 }
 
 // MARK: - 估算
@@ -312,12 +319,14 @@ mod tests {
         Special {
             task_state: "update_task_state".to_string(),
             whole: ["delegate_task", "run_parallel_tasks", "rework_agent", "run_workflow"].map(str::to_string).to_vec(),
+            history: String::new(),
         }
     }
 
     /// == Qt TestContextAssist::foldingSummaries
     #[test]
     fn summaries() {
+        let _prompts = prompts::install_for_tests(prompts::FOLD_NOTES_FOR_TESTS);
         let exactly = "长".repeat(1_500);
         assert_eq!(text(&exactly), exactly);
         let long = "甲".repeat(1_000) + &"长".repeat(1_700) + &"乙".repeat(300);
@@ -354,10 +363,15 @@ mod tests {
         assert_eq!(
             shortened,
             parts[..300].concat()
-                + "\n…（较早的工具结果，已折叠，原 5009 字；需要细节就重新调用工具）…\n"
+                + "\n…（较早的工具结果，已折叠，原 5009 字；需要细节就重新调用只读的工具，会改东西的命令不要重跑）…\n"
                 + &parts[parts.len() - 150..].concat()
         );
         assert!(shortened.ends_with("结尾退出码 1"));
+        // 有 read_history 的（主 Agent）：让它用那个看全文，不说重新调用工具
+        let with_history = Special { history: "read_history".into(), ..special.clone() };
+        let recalled = tool_result("run_shell", &result, &with_history);
+        assert!(recalled.contains("…（较早的工具结果，已折叠，原 5009 字；要看全文用 read_history，不要为了看结果重跑命令）…"));
+        assert!(!recalled.contains("重新调用"));
         // read_agent_log 不是派发类工具：按普通工具结果折叠
         assert_eq!(tool_result("read_agent_log", &result, &special), shortened);
     }
@@ -391,6 +405,7 @@ mod tests {
     /// == Swift 自检 sessionFolding 和 Qt TestContextAssist 的会话折叠
     #[test]
     fn session() {
+        let _prompts = prompts::install_for_tests(prompts::FOLD_NOTES_FOR_TESTS);
         let brief = json!({"role": "user", "content": "任务：看看 a".to_string() + &"。".repeat(2_000)});
         let mut history = vec![brief.clone()];
         for index in 0..6 {

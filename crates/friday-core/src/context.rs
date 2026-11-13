@@ -220,7 +220,7 @@ fn clipped(text: &str, limit: usize, head: usize, tail: usize, note: impl Fn(usi
 
 /// 默认的摘要（没有会话折叠的设置时）：同 ContextFolding 的长度，不认工具名
 fn default_tool_result(text: &str) -> String {
-    clipped(text, 500, 300, 150, |count| format!("\n…（较早的工具结果，已省略，原 {count} 字；需要细节就重新调用工具）…\n"))
+    clipped(text, 500, 300, 150, |count| format!("\n{}\n", folding::folded_note(count, false)))
 }
 
 fn default_text(text: &str) -> String {
@@ -460,12 +460,11 @@ mod tests {
         assert_eq!(target(16_384), 10_752);
     }
 
-    /// 去掉的地方留的说明要用提示词：装一份只有这一段的（== prompts-framework.md 里的原文）
+    /// 去掉的地方留的说明、折叠的工具结果中间的说明要用提示词：装一份只有这几段的（== prompts-framework.md 里的原文）
     fn prompts_installed() -> std::sync::MutexGuard<'static, ()> {
-        let lock = prompts::TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let text = "@@ context-fit.omitted\n（为放进模型的上下文，这里省略了较早的 {{count}} 条消息（对话和工具记录）；需要时重新调用工具查看。）\n";
-        prompts::setup(std::iter::once(("prompts-framework.md".to_string(), text.to_string())).collect(), None, Vec::new());
-        lock
+        let omitted = "@@ context-fit.omitted\n（为放进模型的上下文，这里省略了较早的 {{count}} 条消息（对话和工具记录）；要看原文用 read_history，\
+                       没有这个工具就重新调用只读的工具查看，会改东西的命令不要为了看结果重跑。）\n";
+        prompts::install_for_tests(&(prompts::FOLD_NOTES_FOR_TESTS.to_string() + omitted))
     }
 
     fn message(role: &str, content: &str) -> Value {
@@ -496,7 +495,7 @@ mod tests {
         let budget = folding::estimated_tokens(&history) - 200;
         let result = compact(&mut history, &mut folded, budget, None);
         assert_eq!((result.shortened, result.dropped), (2, 0));
-        assert!(history[2]["content"].as_str().unwrap().contains("较早的工具结果，已省略，原 1600 字"));
+        assert!(history[2]["content"].as_str().unwrap().contains("较早的工具结果，已折叠，原 1600 字；需要细节就重新调用只读的工具"));
         assert!(history[1].get("reasoning_content").is_none());
         assert!(result.after < result.before);
         // 还不够：从最早的整段去掉（用户消息、助手消息连同工具结果），说明放在后面的用户消息前面；最后一条用户消息、最新一步不动
@@ -549,8 +548,10 @@ mod tests {
         // 较早的图片换成说明；会话折叠的设置：子智能体的结果不截、思考留着
         let image = json!({ "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } });
         let user = json!({ "role": "user", "content": [image, { "type": "text", "text": "看图" }] });
-        let summaries =
-            Summaries { echoes_reasoning: true, special: Special { task_state: String::new(), whole: vec!["delegate_task".into()] } };
+        let summaries = Summaries {
+            echoes_reasoning: true,
+            special: Special { task_state: String::new(), whole: vec!["delegate_task".into()], history: String::new() },
+        };
         let shorter = summarized(&user, Some(&summaries));
         assert_eq!(shorter["content"][1]["text"], "（这条消息附的 1 张图片已省略，以节省上下文）");
         let reply = json!({ "role": "assistant", "content": "x", "reasoning_content": "想" });

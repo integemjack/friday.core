@@ -495,10 +495,19 @@ pub fn read_file(path: &str, offset: Option<i64>, limit: Option<i64>, working_di
     Ok(Output::text(file_search::read_lines(&text, offset, limit, MAX_OUTPUT)))
 }
 
+/// 数据目录里的提示词文件：动了受保护的段（protected.txt）就不写，说明原因（prompts::protected_refusal）
+fn guard_prompts(target: &Path, after: &str) -> Result<(), ToolError> {
+    match crate::prompts::protected_refusal(target, after) {
+        Some(refusal) => Err(ToolError::Failed(refusal)),
+        None => Ok(()),
+    }
+}
+
 /// write_file：建好上级目录、整份写入；原来是文字（或没有这个文件）的给出增删行数
 pub fn write_file(path: &str, content: &str) -> Result<Output, ToolError> {
     let target = Path::new(path);
     let before = if target.exists() { read_text(target) } else { Some(String::new()) };
+    guard_prompts(target, content)?;
     create_directory(&parent_of(target)).map_err(ToolError::Failed)?;
     write_atomically(target, content.as_bytes()).map_err(ToolError::Failed)?;
     Ok(Output {
@@ -533,6 +542,7 @@ pub fn edit_file(path: &str, change: &Change, working_directory: &str) -> Result
             (result.text, summary)
         }
     };
+    guard_prompts(target, &edited)?;
     write_atomically(target, edited.as_bytes()).map_err(ToolError::Failed)?;
     Ok(Output { text: truncate(&summary), line_diff: Some(line_diff::count_text(&text, &edited)) })
 }

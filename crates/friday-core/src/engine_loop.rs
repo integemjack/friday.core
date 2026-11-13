@@ -225,10 +225,10 @@ impl Loop {
     }
 
     fn summaries(&self) -> Option<Summaries> {
-        self.settings.folding.as_ref().map(|(_, echoes_reasoning, special)| Summaries {
-            echoes_reasoning: *echoes_reasoning,
-            special: Special { task_state: special.task_state.clone(), whole: special.whole.clone() },
-        })
+        self.settings
+            .folding
+            .as_ref()
+            .map(|(_, echoes_reasoning, special)| Summaries { echoes_reasoning: *echoes_reasoning, special: special.clone() })
     }
 
     /// 估算超过上限（force：不看是否超过）就压历史；压了返回 (压的结果, 上限)
@@ -275,7 +275,7 @@ impl Loop {
                 self.push(user(prompt));
             }
             if let Some((budget, echoes, special)) = &self.settings.folding {
-                let special = Special { task_state: special.task_state.clone(), whole: special.whole.clone() };
+                let special = special.clone();
                 let applied = folding::apply(&mut self.history, &mut self.folded, *budget, *echoes, &special);
                 if applied.steps > 0 {
                     folded = json!({ "steps": applied.steps, "before": applied.before, "after": applied.after });
@@ -786,7 +786,7 @@ mod tests {
     }
 
     fn special() -> Special {
-        Special { task_state: "update_task_state".into(), whole: vec!["delegate_task".into()] }
+        Special { task_state: "update_task_state".into(), whole: vec!["delegate_task".into()], history: String::new() }
     }
 
     /// v2.86 在线模型：不知道上限、被说超长（报错里写了上限）就记下、压完重发一次；之后知道上限，发之前就压；
