@@ -547,7 +547,8 @@ mod tests {
         let dir = scratch("outside");
         let other = scratch("outside-other");
         fs::write(format!("{other}/o.txt"), "a\n").unwrap();
-        let snapshot = before(&format!("echo b >> {other}/o.txt; touch {other}/fresh.txt"), &dir, "/nonexistent-home", "/");
+        // 路径加引号：临时目录的路径里可能有空格（TMPDIR 指到带空格的盘上时，不加引号路径被拆成两个词）
+        let snapshot = before(&format!(r#"echo b >> "{other}/o.txt"; touch "{other}/fresh.txt""#), &dir, "/nonexistent-home", "/");
         std::thread::sleep(Duration::from_millis(20));
         fs::write(format!("{other}/o.txt"), "a\nb\n").unwrap();
         fs::write(format!("{other}/fresh.txt"), "f\n").unwrap();
