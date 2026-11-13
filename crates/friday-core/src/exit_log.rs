@@ -20,6 +20,22 @@ struct Log {
 
 static LOG: Mutex<Option<Log>> = Mutex::new(None);
 
+/// 现在的本地时间。Unix 上不用 chrono::Local：它把时区数据缓存在线程本地存储里，而进程 exit 时先销毁调用线程的线程本地存储、
+/// 再跑 atexit（macOS 的 _tlv_exit、glibc 的 __call_tls_dtors）。Swift 版正是在 atexit 里收尾（Core/ExitLog.swift），那时再取就 panic：
+/// 「退出完成」写不出、标记收不掉，每次正常退出都被下次启动记成「没有正常结束」（2026-11-13）。localtime_r 不经线程本地存储
+#[cfg(unix)]
+fn now() -> String {
+    // 秒数的类型（time_t）跟着 localtime_r 的参数走
+    let seconds = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_secs()) as _;
+    // 全 0 的 tm 是合法的值；localtime_r 只读 seconds、只写 local
+    let mut local: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&seconds, &mut local) };
+    let (year, month) = (local.tm_year + 1900, local.tm_mon + 1);
+    format!("{year:04}-{month:02}-{:02} {:02}:{:02}:{:02}", local.tm_mday, local.tm_hour, local.tm_min, local.tm_sec)
+}
+
+/// Windows 上 chrono 每次直接问系统，不用线程本地存储
+#[cfg(not(unix))]
 fn now() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
@@ -116,6 +132,36 @@ mod tests {
         assert!(directory.join("exit.log.1").exists());
         assert!(log().len() < 1024);
         call("exitLog.finish", "");
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// Swift 版在 atexit 里收尾，那时调用线程的线程本地存储已经销毁（见 now 上的说明）：收尾行照样要写出、标记要收掉。
+    /// 进程退出只能在子进程里试：把这一个测试自己再起一遍，带着目录那个环境变量的是子进程
+    #[cfg(unix)]
+    #[test]
+    fn finishes_inside_atexit() {
+        const CHILD: &str = "FRIDAY_CORE_EXIT_LOG_ATEXIT";
+        extern "C" fn finish() {
+            call("exitLog.finish", "");
+        }
+        if let Some(directory) = std::env::var_os(CHILD) {
+            call("exitLog.start", &json!({ "directory": directory.to_string_lossy(), "version": "v1" }).to_string());
+            call("exitLog.note", &json!({ "text": "要退了" }).to_string());
+            unsafe { libc::atexit(finish) };
+            std::process::exit(0);
+        }
+        let directory = std::env::temp_dir().join(format!("friday-core-exit-log-atexit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "exit_log::tests::finishes_inside_atexit"])
+            .env(CHILD, &directory)
+            .status()
+            .unwrap();
+        let log = std::fs::read_to_string(directory.join("exit.log")).unwrap_or_default();
+        assert!(status.success(), "{status}\n{log}");
+        assert!(log.contains("启动 v1") && log.contains("要退了"), "{log}");
+        assert!(log.contains("退出完成"), "{log}");
+        assert!(!directory.join("exit.running").exists());
         std::fs::remove_dir_all(&directory).unwrap();
     }
 }
