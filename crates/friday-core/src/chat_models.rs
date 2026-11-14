@@ -152,7 +152,7 @@ impl ToolEvent {
         self.status == "running" || self.status == "awaitingApproval"
     }
 
-    /// 别处执行的工具（Friday 的 OpenCode / Claude Code 能力：外部智能体的提问、确认，external）在等用户：
+    /// 别处执行的工具（Friday 的 Claude Code 能力：外部智能体的提问、确认，external）在等用户：
     /// 问的是那边的智能体，它还在等，应用重开后照样能答（下一句话就是回答），不算被应用退出打断
     pub fn waits_elsewhere(&self) -> bool {
         self.status == "awaitingApproval" && self.extra.get("external").and_then(Value::as_bool) == Some(true)
@@ -244,9 +244,9 @@ mod tests {
 
     #[test]
     fn external_waits_survive_restart() {
-        // OpenCode 的提问在等回答（external + awaitingApproval）：重开后留着；外部工具还在跑的照样标中断
+        // Claude Code 的提问在等回答（external + awaitingApproval）：重开后留着；外部工具还在跑的照样标中断
         let mut blocks: Vec<MessageBlock> = serde_json::from_value(json!([
-            {"id": "A", "kind": {"tool": {"_0": {"id": "1", "name": "question", "arguments": "{}", "status": "awaitingApproval", "result": "等你回答", "external": true}}}},
+            {"id": "A", "kind": {"tool": {"_0": {"id": "1", "name": "AskUserQuestion", "arguments": "{}", "status": "awaitingApproval", "result": "等你回答", "external": true}}}},
             {"id": "B", "kind": {"tool": {"_0": {"id": "2", "name": "bash", "arguments": "", "status": "running", "result": "", "external": true}}}},
             {"id": "C", "kind": {"tool": {"_0": {"id": "3", "name": "ask_user", "arguments": "{}", "status": "awaitingApproval", "result": ""}}}},
         ]))

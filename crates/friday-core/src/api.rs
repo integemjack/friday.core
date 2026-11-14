@@ -1482,7 +1482,7 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
         // {chunk, stream, now?} → {chunks?, argumentsDelta?, firstToken?, loop?, done?, tools?, error?: {kind: quota | rateLimit | failed, message,
         // limit?, resetSeconds?}}（chunk 是 SSE data: 的负载原样嵌进来；空的字段不写；loop / error：不再往下读；
         // done：Responses 流的结束事件，等于 [DONE]；tools：chunk 顶层 x_friday.tool 的原样列表——别处执行的工具活动，只显示不执行，
-        // 见 Friday.Powers docs/opencode-protocol.md）
+        // 见 Friday.Powers docs/claudecode-protocol.md）
         "stream.feed" => {
             let now = now(params)?;
             let chunk = params.get("chunk").unwrap_or(&Value::Null);
@@ -1521,8 +1521,9 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
                 "isChat": model_traits::is_chat_model(&model),
             }))
         }
-        // {baseURL, model, sendsEnableThinking, thinking?} → {thinkingSupport, inferredThinking, nativeSwitch, isLocal, echoesReasoning,
-        //   asksParallelToolCalls, thinkingLevels}（thinking：用户设了的思考方式，没设按推断）
+        // {baseURL, model, sendsEnableThinking, thinking?, effortLevels?} → {thinkingSupport, inferredThinking, nativeSwitch, isLocal, echoesReasoning,
+        //   asksParallelToolCalls, thinkingLevels}（thinking：用户设了的思考方式，没设按推断；effortLevels：交给别的智能体做的能力
+        //   （Claude Code）报的这个模型能选的思考档，有就按它列档位）
         "engines.rules" => {
             let (base_url, model) = (string(params, "baseURL")?, string(params, "model")?);
             let sends = params.get("sendsEnableThinking").and_then(Value::as_bool).unwrap_or(false);
@@ -1536,7 +1537,13 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
                 "isLocal": engines::is_local(&base_url),
                 "echoesReasoning": engines::echoes_reasoning(&base_url, &model),
                 "asksParallelToolCalls": engines::asks_parallel_tool_calls(&base_url),
-                "thinkingLevels": engines::thinking_levels(&support),
+                "thinkingLevels": match params.get("effortLevels").and_then(Value::as_array) {
+                    Some(efforts) => {
+                        let efforts: Vec<String> = efforts.iter().filter_map(Value::as_str).map(str::to_string).collect();
+                        engines::effort_thinking_levels(&efforts)
+                    }
+                    None => engines::thinking_levels(&support).to_vec(),
+                },
             }))
         }
         // {path} → [EngineConfig]（读 engines.json：缺的键补默认值，认不出的取值去掉）

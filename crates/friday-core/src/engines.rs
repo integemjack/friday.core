@@ -155,6 +155,19 @@ pub fn thinking_levels(support: &str) -> &'static [&'static str] {
     }
 }
 
+/// 思考档（会话里存的 ThinkingLevel），按从低到高
+pub const EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+/// 交给别的智能体做的能力（Claude Code）报的这个模型能选的思考档（引擎的 effortLevels）→ 可选的档位：
+/// 关 + 它报的（认得的、按从低到高）；它报的是空的（不分档，如 Haiku）= 只能开 / 关（off / medium，medium 当「开」）
+pub fn effort_thinking_levels(efforts: &[String]) -> Vec<&'static str> {
+    let known: Vec<&'static str> = EFFORT_LEVELS.iter().copied().filter(|level| efforts.iter().any(|e| e == level)).collect();
+    if known.is_empty() {
+        return vec!["off", "medium"];
+    }
+    std::iter::once("off").chain(known).collect()
+}
+
 /// 规整一组引擎（不是对象的跳过）
 pub fn normalize(items: Vec<Value>) -> Vec<EngineConfig> {
     items
@@ -190,6 +203,21 @@ pub fn save(path: &Path, engines: &[EngineConfig]) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn effort_levels_from_agent() {
+        let levels = |list: &[&str]| effort_thinking_levels(&list.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(levels(&["max", "low", "high", "medium", "xhigh"]), ["off", "low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(levels(&["low", "medium", "high"]), ["off", "low", "medium", "high"]);
+        // 不分档的、报了不认得的：只能开 / 关
+        assert_eq!(levels(&[]), ["off", "medium"]);
+        assert_eq!(levels(&["turbo"]), ["off", "medium"]);
+        // 引擎上多出来的 effortLevels / summary 读写时原样留着
+        let engines = normalize(vec![json!({"id": "cc", "title": "Claude Code · 默认", "baseURL": "power://claudecode",
+                                            "effortLevels": ["low", "max"], "summary": "Opus 5 with 1M context"})]);
+        let written = serde_json::to_value(&engines).unwrap();
+        assert_eq!((written[0]["effortLevels"].clone(), written[0]["summary"].clone()), (json!(["low", "max"]), json!("Opus 5 with 1M context")));
+    }
 
     #[test]
     fn defaults_and_writing() {

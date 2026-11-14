@@ -50,7 +50,7 @@ pub struct Feed {
     /// Responses 流的结束事件（等于 [DONE]）
     pub done: bool,
     pub error: Option<StreamError>,
-    /// 别处执行的工具的活动（只显示，不执行）：chunk 顶层的 x_friday.tool（OpenCode 的桥：它自己的智能体跑的工具），原样交出去
+    /// 别处执行的工具的活动（只显示，不执行）：chunk 顶层的 x_friday.tool（Claude Code 的桥：它自己的智能体跑的工具），原样交出去
     pub tools: Vec<Value>,
 }
 
@@ -441,7 +441,7 @@ mod tests {
 
     #[test]
     fn external_tool_events() {
-        // OpenCode 的桥：x_friday.tool（delta 空、可能没有 choices）原样交出去，不算进 toolCalls（Friday 只显示、不执行）
+        // Claude Code 的桥：x_friday.tool（delta 空、可能没有 choices）原样交出去，不算进 toolCalls（Friday 只显示、不执行）
         let mut parser = Parser::new(true, true);
         let running = feed(
             &mut parser,
