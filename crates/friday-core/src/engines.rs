@@ -216,7 +216,10 @@ mod tests {
         let engines = normalize(vec![json!({"id": "cc", "title": "Claude Code · 默认", "baseURL": "power://claudecode",
                                             "effortLevels": ["low", "max"], "summary": "Opus 5 with 1M context"})]);
         let written = serde_json::to_value(&engines).unwrap();
-        assert_eq!((written[0]["effortLevels"].clone(), written[0]["summary"].clone()), (json!(["low", "max"]), json!("Opus 5 with 1M context")));
+        assert_eq!(
+            (written[0]["effortLevels"].clone(), written[0]["summary"].clone()),
+            (json!(["low", "max"]), json!("Opus 5 with 1M context"))
+        );
     }
 
     #[test]

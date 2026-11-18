@@ -1521,6 +1521,14 @@ fn dispatch(method: &str, params: &Params) -> Result<Value, ApiError> {
                 "isChat": model_traits::is_chat_model(&model),
             }))
         }
+        // {from, candidates: [{id, name}], newer?} → 同系列里版本最新的那个的 id 或 null（newer：还要比 from 新）。订阅的模型列表刷新后：
+        //   新对话默认的模型没有了换成哪个、同系列出了新版本要不要换（model_traits::successor）
+        "models.successor" => {
+            let candidates = list(params, "candidates")?;
+            let names: Vec<&str> = candidates.iter().map(|item| item.get("name").and_then(Value::as_str).unwrap_or("")).collect();
+            let index = model_traits::successor(&string(params, "from")?, &names, flag(params, "newer"));
+            Ok(json!(index.and_then(|index| candidates[index].get("id").cloned())))
+        }
         // {baseURL, model, sendsEnableThinking, thinking?, effortLevels?} → {thinkingSupport, inferredThinking, nativeSwitch, isLocal, echoesReasoning,
         //   asksParallelToolCalls, thinkingLevels}（thinking：用户设了的思考方式，没设按推断；effortLevels：交给别的智能体做的能力
         //   （Claude Code）报的这个模型能选的思考档，有就按它列档位）
@@ -2271,6 +2279,15 @@ mod tests {
         assert_eq!(parsed("quota.classify", "[1]")["error"]["code"], json!("invalidParams"));
         assert_eq!(parsed("quota.classify", "{")["error"]["code"], json!("invalidParams"));
         assert_eq!(parsed("quota.classify", r#"{"body":"x"}"#)["error"]["code"], json!("invalidParams"));
+    }
+
+    #[test]
+    fn model_successor() {
+        let params = json!({ "from": "Opus 5 (1M)", "candidates": [
+            { "id": "a", "name": "默认" }, { "id": "b", "name": "Opus 5.5" }, { "id": "c", "name": "Opus 5" }] });
+        assert_eq!(parsed("models.successor", &params.to_string())["result"], json!("b"));
+        let newer = json!({ "from": "Opus 5.5", "candidates": [{ "id": "c", "name": "Opus 5" }], "newer": true });
+        assert_eq!(parsed("models.successor", &newer.to_string())["result"], Value::Null);
     }
 
     #[test]
